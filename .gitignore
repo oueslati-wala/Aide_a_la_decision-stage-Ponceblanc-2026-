@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project data & models — large, regenerable, and may contain client info
+data/
+models/
+*.csv
+*.xlsx
