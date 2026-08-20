@@ -1,8 +1,8 @@
 # Estimateur d'offres — Ponceblanc & LBFI
 
-Application Streamlit d'aide à la décision pour le pricing des devis.
+Application d'aide à la décision pour le pricing des devis.
 
-Le commercial saisit **client**, **produit**, **quantité** et **coût total (€)**.  
+Le commercial saisit les informations de l'offre (client, produit, quantité, coût total).
 Le modèle propose un **prix de vente total recommandé (€)**, une **probabilité d'acceptation**, des scénarios (prudent / recommandé / ambitieux) et une courbe de sensibilité.
 
 Les deux sources (Ponceblanc, LBFI) sont **entièrement séparées** : données, features et modèles ne sont jamais mélangés.
@@ -54,6 +54,8 @@ Chaque dossier `models/<source>/` contient :
 - `regressor_marge_{best,lower,upper}.joblib`
 - `product_clusters.json`, `client_encoding.json`
 - `margin_feature_columns.json`, `regressor_target.json`, `metrics.json`
+
+> **Note** : `data/` et `models/` sont exclus du dépôt (`.gitignore`) — ils contiennent des données clients réelles et des artefacts régénérables. Après avoir cloné le dépôt, placez `Query_tableau_devis_with_costs.xlsx` dans `data/`, puis lancez `python train_models.py` pour générer les modèles.
 
 ---
 

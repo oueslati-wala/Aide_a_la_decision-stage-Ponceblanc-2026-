@@ -1,0 +1,43 @@
+{
+  "source": "ponceblanc_marge",
+  "n_total": 1948,
+  "n_train": 1558,
+  "n_test": 390,
+  "acceptance_rate": 0.3521560574948665,
+  "classifier": {
+    "accuracy": 0.6871794871794872,
+    "roc_auc": 0.715919909985286,
+    "features": [
+      "quantite",
+      "produit_cluster",
+      "client_encoded",
+      "cout_total",
+      "prix_total"
+    ],
+    "note": "shared with ponceblanc euro classifier"
+  },
+  "margin_regressor": {
+    "target": "taux_marge",
+    "mode": "taux_marge",
+    "include_cost": true,
+    "mae": 0.4223914730023126,
+    "n_rows": 248,
+    "features": [
+      "quantite",
+      "produit_cluster",
+      "client_encoded",
+      "cout_total"
+    ],
+    "taux_training": {
+      "min": 0.8194425215003043,
+      "p10": 1.1937549822470592,
+      "median": 1.3704008396311982,
+      "p90": 1.9593480305487403,
+      "max": 3.9970553753033236
+    },
+    "mae_eur": 9363.168837513067
+  },
+  "regressor_target": "taux_marge",
+  "regressor_mode": "taux_marge",
+  "target_transform": "identity"
+}

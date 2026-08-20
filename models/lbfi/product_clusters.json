@@ -1,0 +1,10 @@
+{
+  "CALENDRIER": 0,
+  "ECHANTILLONNAGE": 1,
+  "PLV": 2,
+  "NUMÉRIQUE": 3,
+  "PONCEBLANC": 4,
+  "DIVERS": 5,
+  "MARCHÉ ANNUEL": 6,
+  "__OTHER__": 7
+}

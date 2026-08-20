@@ -1,0 +1,6 @@
+{
+  "target": "taux_marge",
+  "mode": "taux_marge",
+  "target_transform": "identity",
+  "include_cost": true
+}

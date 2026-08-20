@@ -1,0 +1,5 @@
+{
+  "target": "coefficient",
+  "mode": "coeff_times_cost",
+  "target_transform": "identity"
+}

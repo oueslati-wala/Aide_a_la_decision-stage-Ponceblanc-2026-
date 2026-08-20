@@ -1,0 +1,47 @@
+{
+  "source": "lbfi",
+  "n_total": 6131,
+  "n_train": 4904,
+  "n_test": 1227,
+  "acceptance_rate": 0.3094111890393084,
+  "classifier": {
+    "accuracy": 0.7383863080684596,
+    "roc_auc": 0.7683915366929721,
+    "features": [
+      "quantite",
+      "produit_cluster",
+      "client_encoded",
+      "cout_total",
+      "prix_total"
+    ]
+  },
+  "margin_regressor": {
+    "target": "coefficient",
+    "mode": "coeff_times_cost",
+    "target_transform": "identity",
+    "mae": 183.64102695210045,
+    "mae_coeff": 0.08378710584807643,
+    "n_rows": 1857,
+    "features": [
+      "quantite",
+      "produit_cluster",
+      "client_encoded",
+      "cout_total"
+    ],
+    "coeff_training": {
+      "min": 0.8049943461097364,
+      "p10": 0.9600245581436423,
+      "median": 1.1667738109645407,
+      "p90": 1.3000000000000005,
+      "max": 2.7215979999999997
+    },
+    "cost_training_range_eur": {
+      "min": 39.69307540854701,
+      "median": 860.6254444444444,
+      "max": 143684.4078935348
+    }
+  },
+  "regressor_target": "coefficient",
+  "regressor_mode": "coeff_times_cost",
+  "target_transform": "identity"
+}
