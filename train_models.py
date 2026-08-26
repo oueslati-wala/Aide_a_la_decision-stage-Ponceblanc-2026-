@@ -62,20 +62,12 @@ def split_data(df):
 
 
 def _fit_extra_encodings(train_df):
-    """Fit encodings for matière only (final feature list)."""
-    matiere_enc = features.fit_categorical_encoding(
-        train_df["matiere"] if "matiere" in train_df.columns else pd.Series(dtype=object),
-        min_count=8,
-    )
-    return {
-        "matiere_encoding": matiere_enc,
-    }
+    """No extra categorical encodings in the final feature set."""
+    return {}
 
 
 def _feature_kwargs(encodings):
-    return dict(
-        matiere_encoding=encodings.get("matiere_encoding"),
-    )
+    return {}
 
 
 # ---------------------------------------------------------------------
@@ -306,7 +298,7 @@ def train_source(source):
     print(f"rows = {len(df)}")
     print(f"acceptance = {df['signe'].mean():.1%}")
 
-    for col in ["matiere", "month"]:
+    for col in ["month"]:
         if col in df.columns:
             nn = int(df[col].notna().sum())
             print(f"  {col}: {nn}/{len(df)} ({100*nn/len(df):.0f}%)")
@@ -327,8 +319,9 @@ def train_source(source):
         json.dump(client_encoding, f, ensure_ascii=False, indent=2)
 
     for name, mapping in encodings.items():
-        with open(output_dir / f"{name}.json", "w", encoding="utf-8") as f:
-            json.dump(mapping, f, ensure_ascii=False, indent=2)
+        if mapping:
+            with open(output_dir / f"{name}.json", "w", encoding="utf-8") as f:
+                json.dump(mapping, f, ensure_ascii=False, indent=2)
 
     classifier, classifier_features, accuracy, auc = train_classifier(
         source,

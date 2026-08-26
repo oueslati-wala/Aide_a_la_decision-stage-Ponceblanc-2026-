@@ -5,8 +5,8 @@
   "n_test": 390,
   "acceptance_rate": 0.3521560574948665,
   "classifier": {
-    "accuracy": 0.6871794871794872,
-    "roc_auc": 0.715919909985286,
+    "accuracy": 0.6717948717948717,
+    "roc_auc": 0.722771991575546,
     "features": [
       "quantite",
       "produit_cluster",

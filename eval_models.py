@@ -11,7 +11,7 @@ the same unified euro workflow used in train_models.py:
       then prix = coefficient * cout_total
 
 Final feature set:
-    client, produit, matiere, quantite, cout_total, season (month/trimester)
+    client, produit, quantite, cout_total, season (4-month blocks)
     (+ prix_total for the classifier only)
 
 Both sources are evaluated identically.
@@ -60,10 +60,9 @@ def evaluate_source(source: str) -> dict:
 
     product_clusters = _load_json(directory / "product_clusters.json") or {}
     client_encoding = _load_json(directory / "client_encoding.json") or {}
-    matiere_encoding = _load_json(directory / "matiere_encoding.json")
     regressor_columns = _load_json(directory / "margin_feature_columns.json") or []
 
-    feat_kwargs = dict(matiere_encoding=matiere_encoding)
+    feat_kwargs = {}
 
     _, test_df = train_test_split(
         df,

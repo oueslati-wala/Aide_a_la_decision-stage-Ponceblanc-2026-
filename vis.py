@@ -28,8 +28,200 @@ import streamlit as st
 import features
 from predict import QuoteEstimator
 
-st.set_page_config(page_title="Estimateur d'offres", layout="wide")
+st.set_page_config(page_title="Estimateur d'offres", layout="wide", page_icon="🧾")
 
+CUSTOM_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+:root {
+    --bg: #FBF6EF;
+    --bg-alt: #F2E9DB;
+    --card: #FFFDF9;
+    --card-border: #E7D9C4;
+    --ink: #2B241C;
+    --ink-soft: #746553;
+    --ink-faint: #A6987F;
+    --accent: #A9552F;
+    --accent-dark: #7A3C1F;
+    --accent-soft: #F0DAC1;
+    --sage: #64735A;
+    --sage-soft: #DEE5D3;
+    --amber: #B3822F;
+    --amber-soft: #F3E3BE;
+    --rose: #A2483E;
+    --rose-soft: #F0D6CF;
+    --radius-lg: 20px;
+    --radius-md: 14px;
+    --shadow: 0 1px 2px rgba(43, 36, 28, 0.04), 0 8px 24px rgba(43, 36, 28, 0.06);
+}
+
+html, body, [class*="css"] { font-family: 'Inter', -apple-system, sans-serif; }
+
+[data-testid="stAppViewContainer"] { background: var(--bg); }
+[data-testid="stHeader"] { background: transparent; }
+
+[data-testid="stSidebar"] {
+    background: var(--bg-alt);
+    border-right: 1px solid var(--card-border);
+}
+[data-testid="stSidebar"] * { color: var(--ink) !important; }
+
+h1, h2, h3 {
+    font-family: 'Fraunces', Georgia, serif !important;
+    color: var(--ink) !important;
+    letter-spacing: -0.01em;
+}
+h1 { font-weight: 600 !important; }
+h2 {
+    font-weight: 600 !important;
+    font-size: 1.5rem !important;
+    margin-top: 2.2rem !important;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--card-border);
+}
+h2::before {
+    content: "";
+    display: block;
+    width: 34px;
+    height: 3px;
+    background: var(--accent);
+    border-radius: 3px;
+    margin-bottom: 0.6rem;
+}
+h3 { font-weight: 600 !important; }
+
+.hero-eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 0.35rem;
+}
+.hero-title {
+    font-family: 'Fraunces', Georgia, serif;
+    font-size: 2.6rem;
+    font-weight: 600;
+    color: var(--ink);
+    line-height: 1.08;
+    margin: 0 0 0.5rem 0;
+}
+.hero-sub {
+    font-family: 'Inter', sans-serif;
+    font-size: 1.02rem;
+    color: var(--ink-soft);
+    max-width: 640px;
+    margin-bottom: 1.6rem;
+}
+
+[data-testid="stMetric"] {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-md);
+    padding: 1rem 1.1rem;
+    box-shadow: var(--shadow);
+}
+[data-testid="stMetricLabel"] {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-soft) !important;
+}
+[data-testid="stMetricValue"] {
+    font-family: 'Fraunces', Georgia, serif !important;
+    color: var(--ink) !important;
+    font-weight: 600 !important;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: var(--card);
+    border: 1px solid var(--card-border) !important;
+    border-radius: var(--radius-lg) !important;
+    box-shadow: var(--shadow);
+    padding: 0.4rem 0.4rem;
+}
+
+[data-testid="stExpander"] {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow);
+}
+
+[data-testid="stDataFrame"], [data-testid="stDataEditor"] {
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+}
+
+[data-testid="stAlertContentSuccess"] {
+    background: var(--sage-soft) !important;
+    border-left: 3px solid var(--sage) !important;
+    border-radius: var(--radius-md);
+    color: var(--ink) !important;
+}
+[data-testid="stAlertContentWarning"] {
+    background: var(--amber-soft) !important;
+    border-left: 3px solid var(--amber) !important;
+    border-radius: var(--radius-md);
+    color: var(--ink) !important;
+}
+[data-testid="stAlertContentError"] {
+    background: var(--rose-soft) !important;
+    border-left: 3px solid var(--rose) !important;
+    border-radius: var(--radius-md);
+    color: var(--ink) !important;
+}
+[data-testid="stAlertContentInfo"] {
+    background: var(--accent-soft) !important;
+    border-left: 3px solid var(--accent) !important;
+    border-radius: var(--radius-md);
+    color: var(--ink) !important;
+}
+
+[data-testid="stRadio"] > div { gap: 0.5rem; }
+[data-testid="stRadio"] label {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    padding: 0.35rem 0.9rem;
+    transition: all 0.15s ease;
+}
+[data-testid="stRadio"] label:hover { border-color: var(--accent); }
+
+[data-baseweb="input"], [data-baseweb="select"] > div {
+    border-radius: 10px !important;
+    border-color: var(--card-border) !important;
+}
+
+.stButton > button, .stDownloadButton > button {
+    background: var(--accent);
+    color: #FFF8F0;
+    border: none;
+    border-radius: 999px;
+    padding: 0.5rem 1.3rem;
+    font-weight: 600;
+    box-shadow: var(--shadow);
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+    background: var(--accent-dark);
+    color: #FFF8F0;
+}
+
+hr { border-color: var(--card-border) !important; }
+
+[data-testid="stCaptionContainer"] {
+    color: var(--ink-faint) !important;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.78rem !important;
+}
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 MODELS_DIR = Path("models")
@@ -54,12 +246,12 @@ def fmt_eur(x: float | int | None, decimals: int = 0) -> str:
 
 
 @st.cache_resource
-def get_estimator(_version: int = 11):
+def get_estimator(_version: int = 16):
     return QuoteEstimator()
 
 
 @st.cache_data
-def get_history(source: str) -> pd.DataFrame:
+def get_history(source: str, _version: int = 16) -> pd.DataFrame:
     try:
         df = features.build_source(source)
         if df is None:
@@ -100,10 +292,9 @@ def cached_recommend(
     produit: str,
     quantite: float,
     cout_total: float,
-    matiere: str | None,
     month: int,
     year: int,
-    _version: int = 11,
+    _version: int = 16,
 ):
     """Cache price recommendation for identical inputs (fast UI)."""
     est = get_estimator()
@@ -113,7 +304,6 @@ def cached_recommend(
         quantite=quantite,
         source=source,
         cout_total=cout_total,
-        matiere=matiere,
         month=month,
         year=year,
     )
@@ -124,7 +314,6 @@ def cached_recommend(
         source=source,
         cout_total=cout_total,
         prix_total=float(rec["prix_median"]),
-        matiere=matiere,
         month=month,
         year=year,
     )
@@ -302,7 +491,15 @@ est = get_estimator()
 
 if page == "Aide à la décision":
 
-    st.title("Aide à la décision")
+    st.markdown(
+        """
+        <div class="hero-eyebrow">Ponceblanc · LBFI — Pricing devis</div>
+        <div class="hero-title">Aide à la décision</div>
+        <div class="hero-sub">Un prix recommandé et une probabilité d'acceptation, calculés
+        à partir de l'historique des devis signés et refusés.</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     source = st.radio(
         "Source",
@@ -371,33 +568,30 @@ if page == "Aide à la décision":
             key=f"produit_{source}",
             help="Tapez pour filtrer la liste, ou saisissez un produit.",
         )
-        produit = str(produit).strip()
+        produit = features.normalize_produit(str(produit).strip())
+        if not isinstance(produit, str):
+            produit = str(produit)
 
-        matiere_options = clean_dropdown_values(history, "matiere")
-        if not matiere_options:
-            matiere_options = ["(non renseigné)"]
-        matiere_options = sorted(set(matiere_options), key=lambda s: str(s).lower())
-        matiere = st.selectbox(
-            "Matière",
-            options=matiere_options,
-            index=0,
-            accept_new_options=True,
-            key=f"matiere_{source}",
-            help="Feature modèle (Ponceblanc). Sur LBFI souvent non disponible → manquant.",
-        )
+        matiere = None
         format_ = None
         fournisseur = None
+        # How many historical rows for this (normalized) product type
+        if not history.empty and "produit" in history.columns and produit:
+            _n_prod = int((history["produit"].astype(str).str.upper() == str(produit).upper()).sum())
+            _aliases = [k for k, v in features.PRODUIT_ALIASES.items() if v == str(produit).upper()]
+            _alias_txt = f" (variantes fusionnées : {', '.join(_aliases)})" if _aliases else ""
+            st.caption(f"**{produit}** : **{_n_prod}** devis dans l'historique de cette source{_alias_txt}.")
+
+        quantite = st.number_input(
+                    "Quantité (Nb exemplaires)",
+                    min_value=1,
+                    value=default_qty,
+                    step=50,
+                    key=f"quantite_{source}",
+                )
 
 
     with col_b:
-        quantite = st.number_input(
-            "Quantité (Nb exemplaires)",
-            min_value=1,
-            value=default_qty,
-            step=50,
-            key=f"quantite_{source}",
-        )
-
         cout_achat = st.number_input(
             "Coût achat (€)",
             min_value=0.0,
@@ -405,7 +599,6 @@ if page == "Aide à la décision":
             step=10.0,
             key=f"achat_{source}",
         )
-
         cout_fabrication = st.number_input(
             "Coût fabrication (€)",
             min_value=0.0,
@@ -413,7 +606,6 @@ if page == "Aide à la décision":
             step=10.0,
             key=f"fabrication_{source}",
         )
-
         cout_transport = st.number_input(
             "Coût transport (€)",
             min_value=0.0,
@@ -421,14 +613,7 @@ if page == "Aide à la décision":
             step=10.0,
             key=f"transport_{source}",
         )
-
-    with col_c:
-        cout_total = (
-            cout_achat
-            + cout_fabrication
-            + cout_transport
-        )
-
+        cout_total = float(cout_achat + cout_fabrication + cout_transport)
         st.number_input(
             "Coût total calculé (€)",
             min_value=0.0,
@@ -436,48 +621,61 @@ if page == "Aide à la décision":
             step=10.0,
             key=f"cout_{source}",
             disabled=True,
-            help="Total reconstruit à partir des coûts détaillés.",
+            help="Total = achat + fabrication + transport.",
         )
+
+    with col_c:
+        
+        # --- Date ↔ saison (4 mois) keep in sync ---
+        season_labels = {
+            1: "S1 — Janvier à Avril",
+            2: "S2 — Mai à Août",
+            3: "S3 — Septembre à Décembre",
+        }
+        season_mid_month = {1: 2, 2: 6, 3: 10}  # representative month for the model
+        date_key = f"date_{source}"
+        season_key = f"season4m_{source}"
+
+        def _season_from_month(m: int) -> int:
+            return min(3, max(1, (int(m) - 1) // 4 + 1))
+
+        # Init session defaults once
+        if date_key not in st.session_state:
+            st.session_state[date_key] = __import__("datetime").date.today()
+        if season_key not in st.session_state:
+            st.session_state[season_key] = _season_from_month(st.session_state[date_key].month)
+
+        # Detect which control the user last changed via dedicated flags
+        def _on_date_change():
+            d = st.session_state.get(date_key)
+            if d is not None:
+                st.session_state[season_key] = _season_from_month(d.month)
+
+        def _on_season_change():
+            s = int(st.session_state.get(season_key, 1))
+            d = st.session_state.get(date_key)
+            if d is not None:
+                # keep year, move day to mid-month of selected season
+                mid = season_mid_month[s]
+                import datetime as _dt
+                day = min(d.day, 28)
+                st.session_state[date_key] = _dt.date(d.year, mid, day)
 
         date_devis = st.date_input(
             "Date du devis",
-            key=f"date_{source}",
-            help="Utilisée pour le mois / trimestre (features apprises du modèle).",
+            key=date_key,
+            on_change=_on_date_change,
+            help="Change la saison automatiquement (S1/S2/S3).",
         )
-
-        period_mode = st.radio(
-            "Période pour le modèle",
-            options=["Mois", "Trimestre"],
-            horizontal=True,
-            key=f"period_mode_{source}",
-            help="Le modèle a appris la saisonnalité sur le mois du devis. "
-                 "Trimestre = mois du milieu du trimestre (fév / mai / août / nov).",
+        season_4m = st.selectbox(
+            "Saison (4 mois)",
+            options=[1, 2, 3],
+            format_func=lambda s: season_labels[s],
+            key=season_key,
+            on_change=_on_season_change,
+            help="Change la date vers le milieu de la saison (même année).",
         )
-
-        month_names = {
-            1: "Janvier", 2: "Février", 3: "Mars", 4: "Avril",
-            5: "Mai", 6: "Juin", 7: "Juillet", 8: "Août",
-            9: "Septembre", 10: "Octobre", 11: "Novembre", 12: "Décembre",
-        }
-        if period_mode == "Mois":
-            month = st.selectbox(
-                "Mois du devis",
-                options=list(range(1, 13)),
-                format_func=lambda m: month_names[m],
-                index=(date_devis.month - 1) if date_devis else 0,
-                key=f"month_{source}",
-            )
-        else:
-            trimestre = st.selectbox(
-                "Trimestre du devis",
-                options=[1, 2, 3, 4],
-                format_func=lambda q: f"T{q} ({month_names[q*3-2][:3]}–{month_names[q*3][:3]})",
-                index=((date_devis.month - 1) // 3) if date_devis else 0,
-                key=f"trimestre_{source}",
-            )
-            # Mid-quarter month so sin/cos match the trimester
-            month = {1: 2, 2: 5, 3: 8, 4: 11}[int(trimestre)]
-
+        month = season_mid_month[int(season_4m)]
         year = int(date_devis.year) if date_devis else 2024
 
         # No manual heuristics — season comes only from month/trimester above
@@ -543,31 +741,35 @@ if page == "Aide à la décision":
             produit=produit,
             quantite=float(quantite),
             cout_total=float(cout_total),
-            matiere=matiere,
             month=int(month),
             year=int(year),
         )
         prix_recommande = float(rec["prix_median"])
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Prix recommandé", fmt_eur(prix_recommande))
-        m2.metric("Coût total", fmt_eur(cout_total))
-        marge_reco = compute_margin(prix_recommande, cout_total)
-        m3.metric(
-            "Marge à la reco",
-            fmt_eur(marge_reco["marge_eur"]),
-            delta=fmt_pct_signed(marge_reco["taux_pct"]),
-            help="Marge en € et en % du coût. Coefficient (prix/coût) : "
-                 f"{fmt_coefficient(marge_reco['coefficient'])}.",
+        prix_unitaire_reco = (
+            prix_recommande / float(quantite) if quantite and float(quantite) > 0 else 0.0
         )
-        m4.metric("P(acceptation) à la reco", f"{proba_reco:.0%}", help=interpret_proba(proba_reco))
 
-        st.success(
-            f"{probability_label(proba_reco)} — Prix recommandé : **{fmt_eur(prix_recommande)}**"
-        )
-        st.caption(
-            f"Intervalle indicatif du modèle : {fmt_eur(rec['prix_lower'])} — {fmt_eur(rec['prix_upper'])}."
-        )
+        with st.container(border=True):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Prix recommandé (total)", fmt_eur(prix_recommande))
+            m2.metric(
+                "Prix unitaire (reco)",
+                f"{prix_unitaire_reco:,.4f} €".replace(",", " "),
+                help="Prix total recommandé ÷ quantité",
+            )
+            m3.metric("Coût total", fmt_eur(cout_total))
+            marge_reco = compute_margin(prix_recommande, cout_total)
+            m4.metric("P(acceptation)", f"{proba_reco:.0%}", help=interpret_proba(proba_reco))
+
+            st.success(
+                f"{probability_label(proba_reco)} — Prix recommandé : "
+                f"**{fmt_eur(prix_recommande)}** "
+                f"({prix_unitaire_reco:,.4f} € / exemplaire)".replace(",", " ")
+            )
+            st.caption(
+                f"Intervalle : {fmt_eur(rec['prix_lower'])} — {fmt_eur(rec['prix_upper'])}."
+            )
 
     except (ValueError, FileNotFoundError) as exc:
         st.error(str(exc))
@@ -578,7 +780,8 @@ if page == "Aide à la décision":
     client_key = client.strip().upper()
     produit_key = produit.strip().upper()
 
-    col_a, col_b = st.columns(2)
+    explain_card = st.container(border=True)
+    col_a, col_b = explain_card.columns(2)
 
     with col_a:
         st.markdown("**Signaux du modèle**")
@@ -597,9 +800,9 @@ if page == "Aide à la décision":
                 bullets.append(f"- **Type produit {produit_key}** : rare → profil plus volatil.")
         bullets.append(f"- **Quantité** : {quantite}")
         bullets.append(f"- **Coût total** : {fmt_eur(cout_total)} (achat + fab + transport)")
-        if matiere:
-            bullets.append(f"- **Matière** : {matiere}")
-        bullets.append(f"- **Saison** : mois={month}, trimestre={int((month-1)//3)+1}, année={year}")
+        season_code = int((month - 1) // 4) + 1
+        season_names = {1: "S1 Jan–Avr", 2: "S2 Mai–Août", 3: "S3 Sep–Déc"}
+        bullets.append(f"- **Saison** : {season_names.get(season_code, season_code)} (année {year})")
         st.markdown("\n".join(bullets))
 
     with col_b:
@@ -612,9 +815,9 @@ if page == "Aide à la décision":
 Modèle **{label}** (ROC-AUC test ≈ **{auc_txt}**).
 
 Entrées **uniquement** :
-client, type de produit, matière, quantité, coût total, date → mois/trimestre.
+client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S3).
 
-**Non utilisés** : délai offre→décision, format, commercial, pression, marge cible saisie.
+**Non utilisés** : matière, délai offre→décision, format, commercial, heuristiques.
 
 - Prix recommandé : **{fmt_eur(prix_recommande)}**
 - P(acceptation) : **{proba_reco:.0%}**
@@ -627,27 +830,66 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
     if stats["n"] == 0:
         st.warning("Aucun devis historique comparable trouvé après filtres.")
     else:
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Devis similaires", stats["n"])
-        k2.metric("Acceptés", f"{stats['n_acc']} ({stats['rate']:.0%})")
+        with st.container(border=True):
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Devis similaires", stats["n"])
+            k2.metric("Acceptés", f"{stats['n_acc']} ({stats['rate']:.0%})")
 
-        k3.metric("Prix médian ACCEPTÉS", fmt_eur(stats['prix_acc_med']) if stats['prix_acc_med'] else "n/a")
-        k4.metric("Prix médian REFUSÉS", fmt_eur(stats['prix_rej_med']) if stats['prix_rej_med'] else "n/a")
+            k3.metric("Prix médian ACCEPTÉS", fmt_eur(stats['prix_acc_med']) if stats['prix_acc_med'] else "n/a")
+            k4.metric("Prix médian REFUSÉS", fmt_eur(stats['prix_rej_med']) if stats['prix_rej_med'] else "n/a")
 
-        k5, k6 = st.columns(2)
-        k5.metric(
-            "Coefficient marge médian ACCEPTÉS",
-            fmt_coefficient(stats['coeff_acc_med']),
-            help="Médiane de prix / coût sur les devis acceptés similaires.",
-        )
-        k6.metric(
-            "Coefficient marge médian REFUSÉS",
-            fmt_coefficient(stats['coeff_rej_med']),
-            help="Médiane de prix / coût sur les devis refusés similaires.",
-        )
+            k5, k6 = st.columns(2)
+            k5.metric(
+                "Coefficient marge médian ACCEPTÉS",
+                fmt_coefficient(stats['coeff_acc_med']),
+                help="Médiane de prix / coût sur les devis acceptés similaires.",
+            )
+            k6.metric(
+                "Coefficient marge médian REFUSÉS",
+                fmt_coefficient(stats['coeff_rej_med']),
+                help="Médiane de prix / coût sur les devis refusés similaires.",
+            )
 
     # Scenarios
-    st.subheader("4. Scénarios de décision")
+    # --- Saisie prix de vente unitaire (→ total = unitaire × quantité) ---
+    st.subheader("4. Votre prix de vente unitaire")
+    pu_key = f"prix_unitaire_saisie_{source}"
+    default_pu = float(prix_recommande / quantite) if quantite and quantite > 0 else 0.0
+    if pu_key not in st.session_state:
+        st.session_state[pu_key] = round(default_pu, 4)
+
+    # When recommended price / qty change a lot, refresh default if user hasn't locked
+    cost_sync_key = f"pu_sync_cost_{source}"
+    if (
+        cost_sync_key not in st.session_state
+        or abs(float(st.session_state.get(cost_sync_key, 0)) - float(cout_total)) > 1.0
+    ):
+        st.session_state[pu_key] = round(default_pu, 4)
+        st.session_state[cost_sync_key] = float(cout_total)
+
+    col_pu, col_pt = st.columns(2)
+    with col_pu:
+        prix_unitaire_saisi = st.number_input(
+            "Prix de vente unitaire (€ / exemplaire)",
+            min_value=0.0,
+            value=float(st.session_state[pu_key]),
+            step=0.01,
+            format="%.4f",
+            key=f"pu_input_{source}",
+            help="Saisissez le prix de vente par exemplaire. Le total = unitaire × quantité.",
+        )
+        st.session_state[pu_key] = float(prix_unitaire_saisi)
+    with col_pt:
+        prix_total_from_unit = float(prix_unitaire_saisi) * float(quantite)
+        st.metric("Prix de vente total correspondant", fmt_eur(prix_total_from_unit))
+        st.caption(f"= {prix_unitaire_saisi:.4f} € × {int(quantite)} exemplaires")
+
+    # Drive "Votre choix" from unit price
+    choice_key = f"votre_choix_prix_{source}"
+    st.session_state[choice_key] = float(prix_total_from_unit)
+
+    st.subheader("5. Scénarios de décision")
+
 
     # Hard bounds: models were trained on realistic quote ranges.
     # Anything outside this is treated as out-of-distribution.
@@ -659,9 +901,11 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
     def _scenario_row(name: str, p_val: float) -> dict:
         p_val = float(p_val)
         if p_val <= 0:
+            pu = p_val / float(quantite) if quantite and float(quantite) > 0 else 0.0
             return {
                 "Scénario": name,
-                "Prix de vente total (€)": p_val,
+                "Prix total (€)": p_val,
+                "Prix unitaire (€)": round(pu, 4),
                 "Marge (€)": None,
                 "Taux de marge": None,
                 "P(acceptation)": "n/a",
@@ -672,7 +916,8 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
             margin = compute_margin(p_val, cout_total)
             return {
                 "Scénario": name,
-                "Prix de vente total (€)": p_val,
+                "Prix total (€)": p_val,
+                "Prix unitaire (€)": round(p_val / float(quantite), 4) if quantite and float(quantite) > 0 else 0.0,
                 "Marge (€)": margin["marge_eur"],
                 "Taux de marge": margin["coefficient"],
                 "P(acceptation)": "n/a",
@@ -686,7 +931,8 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
             margin = compute_margin(p_val, cout_total)
             return {
                 "Scénario": name,
-                "Prix de vente total (€)": p_val,
+                "Prix total (€)": p_val,
+                "Prix unitaire (€)": round(p_val / float(quantite), 4) if quantite and float(quantite) > 0 else 0.0,
                 "Marge (€)": margin["marge_eur"],
                 "Taux de marge": margin["coefficient"],
                 "P(acceptation)": "~0%",
@@ -717,7 +963,8 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
         margin = compute_margin(p_val, cout_total)
         return {
             "Scénario": name,
-            "Prix de vente total (€)": p_val,
+            "Prix total (€)": p_val,
+                "Prix unitaire (€)": round(p_val / float(quantite), 4) if quantite and float(quantite) > 0 else 0.0,
             "Marge (€)": margin["marge_eur"],
             "Taux de marge": margin["coefficient"],
             "P(acceptation)": f"{proba:.0%}",
@@ -776,22 +1023,12 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
             f"Meilleure P(accept) ({max_acc['proba']:.0%})"
         ] = float(max_acc["prix"])
 
+    # "Votre choix" follows the unit selling price input above
     choice_key = f"votre_choix_prix_{source}"
-    cost_key = f"votre_choix_cost_{source}"
-    default_choice = float(max(cout_total, round(prix_recommande, -1)))
-
-    if (
-        choice_key not in st.session_state
-        or cost_key not in st.session_state
-        or abs(float(st.session_state.get(cost_key, 0)) - float(cout_total)) > 1.0
-        or float(st.session_state.get(choice_key, 0)) > MAX_PRICE
-        or float(st.session_state.get(choice_key, 0)) < 0
-    ):
-        st.session_state[choice_key] = default_choice
-        st.session_state[cost_key] = float(cout_total)
+    st.session_state[choice_key] = float(prix_total_from_unit)
 
     # Batch scenario probabilities (one classifier call)
-    scenario_items = list(anchor_prices.items()) + [("Votre choix", st.session_state[choice_key])]
+    scenario_items = list(anchor_prices.items()) + [("Votre choix (via PU)", st.session_state[choice_key])]
     scen_prices = np.array([float(v) for _, v in scenario_items], dtype=float)
     try:
         scen_rows = [
@@ -813,9 +1050,11 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
         p_val = float(p_val)
         margin = compute_margin(p_val, cout_total)
         if p_val < cout_total:
+            pu = p_val / float(quantite) if quantite and float(quantite) > 0 else 0.0
             rows.append({
                 "Scénario": name,
-                "Prix de vente total (€)": p_val,
+                "Prix total (€)": p_val,
+                "Prix unitaire (€)": round(pu, 4),
                 "Marge (€)": margin["marge_eur"],
                 "Taux de marge": margin["coefficient"],
                 "P(acceptation)": "n/a",
@@ -824,9 +1063,11 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
             })
             continue
         proba = float(scen_probs[i]) if np.isfinite(scen_probs[i]) else 0.0
+        pu = p_val / float(quantite) if quantite and float(quantite) > 0 else 0.0
         rows.append({
             "Scénario": name,
-            "Prix de vente total (€)": p_val,
+            "Prix total (€)": p_val,
+            "Prix unitaire (€)": round(pu, 4),
             "Marge (€)": margin["marge_eur"],
             "Taux de marge": margin["coefficient"],
             "P(acceptation)": f"{proba:.0%}",
@@ -845,11 +1086,15 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
         display_df,
         column_config={
             "Scénario": st.column_config.TextColumn(disabled=True),
-            "Prix de vente total (€)": st.column_config.NumberColumn(
+            "Prix total (€)": st.column_config.NumberColumn(
                 min_value=MIN_PRICE,
                 max_value=float(MAX_PRICE),
                 step=10.0,
                 format="%.2f €",
+            ),
+            "Prix unitaire (€)": st.column_config.NumberColumn(
+                disabled=True,
+                format="%.4f €",
             ),
             "Marge (€)": st.column_config.NumberColumn(disabled=True, format="%.2f €"),
             "Taux de marge": st.column_config.NumberColumn(disabled=True, format="%.2f"),
@@ -857,7 +1102,7 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
             "Risque": st.column_config.TextColumn(disabled=True),
             "Lecture": st.column_config.TextColumn(disabled=True),
         },
-        disabled=["Scénario", "Marge (€)", "Taux de marge", "P(acceptation)", "Risque", "Lecture"],
+        disabled=["Scénario", "Prix unitaire (€)", "Marge (€)", "Taux de marge", "P(acceptation)", "Risque", "Lecture"],
         hide_index=True,
         width="stretch",
         num_rows="fixed",
@@ -865,15 +1110,22 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
     )
 
     new_choice_price = float(
-        edited_df.loc[edited_df["Scénario"] == "Votre choix", "Prix de vente total (€)"].iloc[0]
+        edited_df.loc[
+            edited_df["Scénario"].astype(str).str.startswith("Votre choix"),
+            "Prix total (€)",
+        ].iloc[0]
     )
     new_choice_price = max(MIN_PRICE, min(float(MAX_PRICE), new_choice_price))
     if abs(new_choice_price - float(st.session_state[choice_key])) > 0.01:
         st.session_state[choice_key] = new_choice_price
+        # keep unit price in sync
+        if quantite and float(quantite) > 0:
+            st.session_state[pu_key] = round(new_choice_price / float(quantite), 4)
         st.rerun()
 
+
     # Sensibilité — only compute when expander is open (saves a full grid on every tweak)
-    st.subheader("5. Sensibilité")
+    st.subheader("6. Sensibilité")
     with st.expander("Afficher la courbe P(acceptation) vs prix", expanded=False):
         st.caption(
             f"Coût fixé à **{fmt_eur(cout_total)}**. Variation du prix de vente total uniquement."
@@ -903,20 +1155,69 @@ client, type de produit, matière, quantité, coût total, date → mois/trimest
             st.error(str(exc))
 
     # History Table
-    st.subheader("6. Devis historiques comparables")
+    st.subheader("7. Devis historiques comparables")
     if similar.empty:
-        st.info("Aucun devis comparable.")
+        st.info("Aucun devis comparable après filtres (client / produit / quantité).")
     else:
-        cols = [c for c in ["devis_code", "client", "produit", "quantite", "cout_total", "prix_total", "signe"] if c in similar.columns]
+        n_sim = len(similar)
+        n_acc = int((similar["signe"] == 1).sum()) if "signe" in similar.columns else 0
+        n_rej = int((similar["signe"] == 0).sum()) if "signe" in similar.columns else 0
+        n_clients = int(similar["client"].nunique()) if "client" in similar.columns else 0
+        n_produits = int(similar["produit"].nunique()) if "produit" in similar.columns else 0
+        qty_min = float(similar["quantite"].min()) if "quantite" in similar.columns else None
+        qty_max = float(similar["quantite"].max()) if "quantite" in similar.columns else None
+
+        # Same product type only (exact) vs current filter set
+        exact_prod = similar[similar["produit"].astype(str).str.upper() == str(produit).upper()] if "produit" in similar.columns else similar
+        n_exact = len(exact_prod)
+
+        # Two rows so values (esp. qty range) are not truncated
+        r1 = st.columns(3)
+        r1[0].metric("Similaires", f"{n_sim}")
+        r1[1].metric("Même produit", f"{n_exact}")
+        r1[2].metric("Clients distincts", f"{n_clients}")
+
+        r2 = st.columns(3)
+        r2[0].metric("Acceptés", f"{n_acc}")
+        r2[1].metric("Refusés", f"{n_rej}")
+        if qty_min is not None:
+            r2[2].metric(
+                "Quantité",
+                f"{qty_min:,.0f} – {qty_max:,.0f}".replace(",", " "),
+            )
+        else:
+            r2[2].metric("Quantité", "—")
+
+        st.caption(
+            f"Tableau : jusqu'à **20** lignes sur **{n_sim}** devis similaires "
+            f"(client ≈ « {client} », produit ≈ « {produit} », "
+            f"quantité ±{qty_band:.0%}). "
+            f"Types produit distincts dans ce filtre : **{n_produits}**."
+        )
+
+        cols = [c for c in ["devis_code", "client", "produit", "quantite", "cout_total", "prix_total", "prix_unitaire", "signe"] if c in similar.columns]
         disp = similar[cols].head(20).copy()
         if "cout_total" in disp:
             disp["cout_total"] = disp["cout_total"].map(fmt_eur)
         if "prix_total" in disp:
             disp["prix_total"] = disp["prix_total"].map(fmt_eur)
+        if "prix_unitaire" in disp:
+            disp["prix_unitaire"] = disp["prix_unitaire"].map(lambda v: f"{float(v):,.4f} €".replace(",", " ") if pd.notna(v) else "—")
         if "signe" in disp:
             disp["signe"] = disp["signe"].map({1: "Accepté", 0: "Refusé"})
-        disp = disp.rename(columns={"devis_code": "Devis", "client": "Client", "produit": "Produit", "quantite": "Quantité", "cout_total": "Coût total", "prix_total": "Prix de vente total", "signe": "Résultat"})
+        disp = disp.rename(columns={
+            "devis_code": "Devis",
+            "client": "Client",
+            "produit": "Produit",
+            "quantite": "Quantité",
+            "cout_total": "Coût total",
+            "prix_total": "Prix total",
+            "prix_unitaire": "Prix unitaire",
+            "signe": "Résultat",
+        })
         st.dataframe(disp, width="stretch", hide_index=True)
+        if n_sim > 20:
+            st.caption(f"… et {n_sim - 20} autres non affichés (affinez les filtres pour réduire).")
 
 
 # ===========================================================================
@@ -928,28 +1229,40 @@ elif page == "Performance des modèles":
     st.title("Performance des modèles")
     st.caption(
         "Évaluation alignée sur `eval_models.py` : split test 20 %, "
-        "même features finales (client, produit, matière, quantité, coût, saison mois/trimestre)."
+        "mêmes features finales (client, produit, quantité, coût, saison 4 mois)."
     )
+
+    if "live_eval_results" not in st.session_state:
+        st.session_state.live_eval_results = {}
 
     run_live = st.checkbox(
         "Recalculer sur le jeu de test (eval_models) — plus lent",
         value=False,
-        help="Sinon : lit metrics.json sauvegardé à l'entraînement (instantané).",
+        help="Lance l'évaluation et **conserve** les résultats à l'écran jusqu'au prochain recalcul.",
     )
+    c_run, c_clear = st.columns([1, 1])
+
+    if run_live:
+        try:
+            import eval_models
+            for src in ("ponceblanc", "lbfi"):
+                with st.spinner(f"Évaluation {src}…"):
+                    st.session_state.live_eval_results[src] = eval_models.evaluate_source(src)
+            st.success("Évaluation terminée — résultats conservés sur cet écran.")
+            # Uncheck is not possible programmatically for checkbox easily; user can leave it
+        except Exception as exc:
+            st.error(f"Évaluation live impossible : {exc}")
+
+    if st.session_state.live_eval_results:
+        st.caption("Affichage des **derniers résultats live** sauvegardés en session.")
+    else:
+        st.caption("Affichage depuis **metrics.json** (entraînement). Cochez la case pour recalculer.")
 
     for src in ("ponceblanc", "lbfi"):
         title = "PONCEBLANC" if src == "ponceblanc" else "LBFI"
         st.subheader(title)
 
-        live = None
-        if run_live:
-            try:
-                import eval_models
-                with st.spinner(f"Évaluation {src}…"):
-                    live = eval_models.evaluate_source(src)
-            except Exception as exc:
-                st.error(f"Évaluation live impossible : {exc}")
-                live = None
+        live = st.session_state.live_eval_results.get(src)
 
         metrics = get_metrics(src)
         if live is None and not metrics:
@@ -978,12 +1291,13 @@ elif page == "Performance des modèles":
                 "features": reg_m.get("features") or [],
             }
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Devis utilisables", f"{n_total:,}")
-        c2.metric("Taux acceptation", f"{acc_rate:.0%}")
-        c3.metric("Accuracy (test)", f"{clf.get('accuracy', 0):.1%}")
-        auc = clf.get("roc_auc")
-        c4.metric("ROC-AUC (test)", f"{auc:.3f}" if auc is not None else "n/a")
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Devis utilisables", f"{n_total:,}")
+            c2.metric("Taux acceptation", f"{acc_rate:.0%}")
+            c3.metric("Accuracy (test)", f"{clf.get('accuracy', 0):.1%}")
+            auc = clf.get("roc_auc")
+            c4.metric("ROC-AUC (test)", f"{auc:.3f}" if auc is not None else "n/a")
 
         st.markdown("#### Classifieur — P(acceptation)")
         report = clf.get("report")
@@ -1059,10 +1373,9 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 | **Source** | Ponceblanc ou LBFI (modèles entraînés séparément) |
 | **Client** | Nom client (liste historique + saisie libre) |
 | **Produit / type** | Type de produit |
-| **Matière** | Support / matière (feature modèle) |
 | **Quantité** | Nombre d'exemplaires |
 | **Coût (€)** | Achat + fabrication + transport → total |
-| **Date** | → mois / trimestre (saison) |
+| **Date** | → saison 4 mois (S1 Jan–Avr / S2 Mai–Août / S3 Sep–Déc) |
 
 ## Ce que le modèle renvoie
 
@@ -1085,10 +1398,9 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 |-------|------|
 | Client | taux d'acceptation lissé |
 | Type de produit | cluster |
-| Matière | code catégorie (+ manquant explicite) |
 | Quantité | volume |
 | Coût total | achat + fabrication + transport |
-| Date → mois / trimestre | saisonnalité |
+| Date → saison 4 mois | S1 / S2 / S3 |
 | Prix candidat | classifieur uniquement (P(accept)) |
 
 **Non utilisés** : délai offre→décision (ne pilote pas la décision client), format, commercial, heuristiques pression / marge cible.
@@ -1097,7 +1409,6 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 
 - Peu d'historique pour un client / produit rare → confiance plus faible.
 - Prix très éloignés du coût (coeff > ~3–5×) sont hors zone d'entraînement.
-- Matière ~34 % de couverture seulement (catégorie « manquant » explicite).
 - Le modèle ne remplace pas le jugement commercial.
 
 """

@@ -2,29 +2,26 @@
 features.py
 ===========
 
-Data preparation for Ponceblanc and LBFI.
+Data preparation for Ponceblanc and LBFI (sources fully separated).
 
-IMPORTANT
----------
-The two sources are completely separated.
+Final model feature set
+-----------------------
+    - client          (smoothed acceptance rate)
+    - produit         (cluster)
+    - quantite
+    - cout_total      (achat + fabrication + transport, €)
+    - season          (4-month blocks: Jan–Apr / May–Aug / Sep–Dec)
+    - prix_total      (classifier only: candidate selling price)
 
-Both sources use the same EURO workflow when cost data is available:
+Explicitly excluded
+-------------------
+    - historical delai_jours (offer → decision): does not drive client decision;
+      also leaks the label on Ponceblanc
+    - format, commercial, dimensions
+    - manual UI heuristics
 
-    Inputs:
-        - client
-        - produit
-        - quantite
-        - cout_total (€)
-        - candidate prix_total (€), when evaluating acceptance
-        - plus available context: matiere, format_dims, commercial,
-          month/year, longueur/largeur, delai_jours (when present in source data)
-
-    Target for the price model:
-        - coefficient = prix_total / cout_total on accepted quotes
-          (price is recovered as coefficient × cout_total)
-
-    Margin rates / coefficients are display-only and never fed into the models
-    as targets; they may appear as derived features only when grounded in data.
+Target for the price model: coefficient = prix_total / cout_total on accepted
+quotes; displayed price = coefficient × cout_total.
 """
 
 from __future__ import annotations
@@ -379,6 +376,42 @@ def _clean_text(
     )
 
 
+# Singular / spelling variants → canonical product type (training + UI)
+PRODUIT_ALIASES = {
+    "LIASSES": "LIASSE",
+    "COLLECTIONS": "COLLECTION",
+    "ECHANTILLONS": "ECHANTILLONNAGE",
+    "ECHANTILLON": "ECHANTILLONNAGE",
+    "ECHANTILLONAGES": "ECHANTILLONNAGE",
+    "ECHANTILLONNAGES": "ECHANTILLONNAGE",
+    "PONCEBLANVC": "PONCEBLANC",
+    "PONCE BLANC": "PONCEBLANC",
+    "NUANCIERS": "NUANCIER",
+    "BOITES": "BOITE",
+    "VALISES": "VALISE",
+    "PANNEAU": "PANNEAUX",
+    "CLASSEURS": "CLASSEUR",
+    "CUSTODE": "CUSTODES",
+    "CALENDRIERS": "CALENDRIER",
+    "NUMERIQUE": "NUMÉRIQUE",
+    "PLVS": "PLV",
+}
+
+
+def normalize_produit(value) -> str | float:
+    """Map plural / typo variants to a single canonical product label."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return np.nan
+    key = str(value).strip().upper()
+    if key in ("", "NAN", "NONE"):
+        return np.nan
+    return PRODUIT_ALIASES.get(key, key)
+
+
+def normalize_produit_series(series: pd.Series) -> pd.Series:
+    return series.map(normalize_produit)
+
+
 def _normalize_format(series: pd.Series) -> pd.Series:
     """Normalize FORMAT strings: collapse spaces/x/X variants."""
     s = series.astype(str).str.strip().str.upper()
@@ -444,8 +477,8 @@ def standardize_ponceblanc(
         df["Nom Client"]
     )
 
-    out["produit"] = _clean_text(
-        df["Type de produit"]
+    out["produit"] = normalize_produit_series(
+        _clean_text(df["Type de produit"])
     )
 
     out["quantite"] = _parse_fr_number(
@@ -589,8 +622,8 @@ def standardize_lbfi(
         df["Nom Client"]
     )
 
-    out["produit"] = _clean_text(
-        df["Type de produit"]
+    out["produit"] = normalize_produit_series(
+        _clean_text(df["Type de produit"])
     )
 
     out["quantite"] = _parse_fr_number(
@@ -1029,144 +1062,53 @@ def build_feature_matrix(
     log_cost: bool = False,
     log_price: bool = False,
     include_cost: bool = False,
-    # Optional extra encodings (fitted at train time, saved next to models)
+    # Kept for backward compatibility with older call sites (ignored)
     matiere_encoding: dict | None = None,
     format_encoding: dict | None = None,
     commercial_encoding: dict | None = None,
     commercial_target_encoding: dict | None = None,
 ) -> pd.DataFrame:
+    """
+    Final feature set:
+        client, produit, quantite, cout_total,
+        season from date (4-month blocks + month sin/cos)
+        + prix_total when include_price (classifier only)
 
-    X = pd.DataFrame(
-        index=df.index
+    NOT used: matiere, historical delai_jours, format, commercial, dimensions.
+    """
+    X = pd.DataFrame(index=df.index)
+
+    X["quantite"] = pd.to_numeric(df["quantite"], errors="coerce")
+    X["produit_cluster"] = apply_product_clusters(df["produit"], product_clusters)
+    X["client_encoded"] = apply_client_encoding(df["client"], client_encoding)
+
+    # Season: 4-month blocks (1=Jan–Apr, 2=May–Aug, 3=Sep–Dec)
+    month = (
+        pd.to_numeric(df["month"], errors="coerce")
+        if "month" in df.columns
+        else pd.Series(np.nan, index=df.index)
     )
-
-    X["quantite"] = pd.to_numeric(
-        df["quantite"],
-        errors="coerce",
-    )
-
-    X["produit_cluster"] = (
-        apply_product_clusters(
-            df["produit"],
-            product_clusters,
-        )
-    )
-
-    X["client_encoded"] = (
-        apply_client_encoding(
-            df["client"],
-            client_encoding,
-        )
-    )
-
-    # --- Calendar features from real month/year when available ---
-    month = pd.to_numeric(df["month"], errors="coerce") if "month" in df.columns else pd.Series(np.nan, index=df.index)
-    # Default mid-year when unknown so sin/cos stay defined
     month_filled = month.fillna(6.0).clip(1, 12)
     X["month"] = month_filled.astype(float)
     X["month_sin"] = np.sin(2 * np.pi * month_filled / 12.0)
     X["month_cos"] = np.cos(2 * np.pi * month_filled / 12.0)
     X["month_known"] = month.notna().astype(float)
-
-    year = pd.to_numeric(df["year"], errors="coerce") if "year" in df.columns else pd.Series(np.nan, index=df.index)
-    X["year"] = year.fillna(2024.0).astype(float)
-    X["year_known"] = year.notna().astype(float)
-
-    # --- Dimensions (LBFI primarily) ---
-    if "longueur" in df.columns:
-        longueur = pd.to_numeric(df["longueur"], errors="coerce")
-        X["log_longueur"] = np.log1p(longueur.clip(lower=0).fillna(0))
-        X["longueur_known"] = longueur.notna().astype(float)
-    else:
-        X["log_longueur"] = 0.0
-        X["longueur_known"] = 0.0
-
-    if "largeur" in df.columns:
-        largeur = pd.to_numeric(df["largeur"], errors="coerce")
-        X["log_largeur"] = np.log1p(largeur.clip(lower=0).fillna(0))
-        X["largeur_known"] = largeur.notna().astype(float)
-    else:
-        X["log_largeur"] = 0.0
-        X["largeur_known"] = 0.0
-
-    # Area proxy when both dims present
-    if "longueur" in df.columns and "largeur" in df.columns:
-        L = pd.to_numeric(df["longueur"], errors="coerce")
-        W = pd.to_numeric(df["largeur"], errors="coerce")
-        area = (L * W).where(L.notna() & W.notna())
-        X["log_area"] = np.log1p(area.clip(lower=0).fillna(0))
-        X["area_known"] = area.notna().astype(float)
-    else:
-        X["log_area"] = 0.0
-        X["area_known"] = 0.0
-
-    # --- Matière (Ponceblanc; sparse → explicit missing flag + code) ---
-    if matiere_encoding is not None and "matiere" in df.columns:
-        X["matiere_code"] = apply_categorical_encoding(df["matiere"], matiere_encoding)
-        X["matiere_known"] = df["matiere"].notna().astype(float)
-    else:
-        X["matiere_code"] = 0.0
-        X["matiere_known"] = 0.0
-
-    # --- Format (Ponceblanc text dims) ---
-    if format_encoding is not None and "format_dims" in df.columns:
-        X["format_code"] = apply_categorical_encoding(df["format_dims"], format_encoding)
-        X["format_known"] = df["format_dims"].notna().astype(float)
-    else:
-        X["format_code"] = 0.0
-        X["format_known"] = 0.0
-
-    # --- Commercial (Ponceblanc; high coverage → target-encode + code) ---
-    if commercial_encoding is not None and "commercial" in df.columns:
-        X["commercial_code"] = apply_categorical_encoding(df["commercial"], commercial_encoding)
-        X["commercial_known"] = df["commercial"].notna().astype(float)
-    else:
-        X["commercial_code"] = 0.0
-        X["commercial_known"] = 0.0
-
-    if commercial_target_encoding is not None and "commercial" in df.columns:
-        X["commercial_rate"] = apply_target_encoding(df["commercial"], commercial_target_encoding)
-    else:
-        X["commercial_rate"] = client_encoding.get("__GLOBAL__", 0.3) if client_encoding else 0.3
-
-    # NOTE: delai_jours is intentionally NOT a model feature.
-    # On Ponceblanc it is almost only populated after acceptance (dossier ouvert),
-    # so delai_known would leak the label (~96% accept when known vs ~0.6% when missing).
+    # 4-month season code
+    X["season_4m"] = ((month_filled - 1) // 4 + 1).astype(float).clip(1, 3)
 
     if include_cost:
-
-        cost = pd.to_numeric(
-            df["cout_total"],
-            errors="coerce",
-        )
-
+        cost = pd.to_numeric(df["cout_total"], errors="coerce")
         if log_cost:
-            cost = np.log1p(
-                cost.clip(lower=0)
-            )
-
+            cost = np.log1p(cost.clip(lower=0))
         X["cout_total"] = cost
 
     if include_price:
-
-        price = pd.to_numeric(
-            df["prix_total"],
-            errors="coerce",
-        )
-
+        price = pd.to_numeric(df["prix_total"], errors="coerce")
         if log_price:
-            price = np.log1p(
-                price.clip(lower=0)
-            )
-
+            price = np.log1p(price.clip(lower=0))
         X["prix_total"] = price
 
-    # Only Ponceblanc uses this (legacy path).
     if include_taux_marge:
-
-        X["taux_marge"] = pd.to_numeric(
-            df["taux_marge"],
-            errors="coerce",
-        )
+        X["taux_marge"] = pd.to_numeric(df["taux_marge"], errors="coerce")
 
     return X

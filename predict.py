@@ -191,7 +191,7 @@ class QuoteEstimator:
         format_dims: str | None = None,
         fournisseur: str | None = None,
     ) -> tuple[float, float]:
-        """No post-model heuristics. Season comes from month/trimester in the feature matrix."""
+        """No post-model heuristics. Season comes from 4-month blocks (season_4m) in the feature matrix."""
         return (1.0, 1.0)
 
     # -----------------------------------------------------------------
