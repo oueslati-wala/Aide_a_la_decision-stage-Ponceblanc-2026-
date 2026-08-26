@@ -1,1 +1,1 @@
-["quantite", "produit_cluster", "client_encoded", "cout_total"]
+["quantite", "produit_cluster", "client_encoded", "month", "month_sin", "month_cos", "month_known", "year", "year_known", "log_longueur", "longueur_known", "log_largeur", "largeur_known", "log_area", "area_known", "matiere_code", "matiere_known", "format_code", "format_known", "commercial_code", "commercial_known", "commercial_rate", "cout_total"]

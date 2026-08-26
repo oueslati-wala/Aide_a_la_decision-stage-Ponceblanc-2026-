@@ -6,8 +6,10 @@ Train separate models for Ponceblanc and LBFI.
 
 Both sources now use the same euro logic when cost data is available:
     - classifier sees candidate selling price in euros + total cost in euros
-    - price regressor predicts TOTAL SELLING PRICE IN EUROS
-    - no margin rate / price-cost coefficient in the model features
+      + all available context features (matiere, format, commercial, calendar,
+      dimensions when present; historical delai is NOT a feature)
+    - price regressor predicts coefficient = prix / coût on accepted quotes;
+      price is recovered as coefficient × coût
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import pandas as pd
 
 from sklearn.ensemble import (
     HistGradientBoostingClassifier,
@@ -58,6 +61,23 @@ def split_data(df):
         )
 
 
+def _fit_extra_encodings(train_df):
+    """Fit encodings for matière only (final feature list)."""
+    matiere_enc = features.fit_categorical_encoding(
+        train_df["matiere"] if "matiere" in train_df.columns else pd.Series(dtype=object),
+        min_count=8,
+    )
+    return {
+        "matiere_encoding": matiere_enc,
+    }
+
+
+def _feature_kwargs(encodings):
+    return dict(
+        matiere_encoding=encodings.get("matiere_encoding"),
+    )
+
+
 # ---------------------------------------------------------------------
 # CLASSIFIER
 # ---------------------------------------------------------------------
@@ -68,9 +88,11 @@ def train_classifier(
     test_df,
     product_clusters,
     client_encoding,
+    encodings,
     output_dir,
 ):
-    # Same euro feature set for both sources (cost + candidate price).
+    kwargs = _feature_kwargs(encodings)
+
     X_train = features.build_feature_matrix(
         train_df,
         product_clusters,
@@ -79,6 +101,7 @@ def train_classifier(
         log_price=True,
         include_cost=True,
         log_cost=True,
+        **kwargs,
     )
 
     X_test = features.build_feature_matrix(
@@ -89,9 +112,9 @@ def train_classifier(
         log_price=True,
         include_cost=True,
         log_cost=True,
+        **kwargs,
     )
 
-    # Remove columns that are completely NaN.
     all_nan = [
         col
         for col in X_train.columns
@@ -99,14 +122,8 @@ def train_classifier(
     ]
 
     if all_nan:
-
-        X_train = X_train.drop(
-            columns=all_nan
-        )
-
-        X_test = X_test.drop(
-            columns=all_nan
-        )
+        X_train = X_train.drop(columns=all_nan)
+        X_test = X_test.drop(columns=all_nan)
 
     classifier = HistGradientBoostingClassifier(
         max_depth=6,
@@ -121,55 +138,24 @@ def train_classifier(
         train_df["signe"],
     )
 
-    probability = (
-        classifier
-        .predict_proba(X_test)[:, 1]
-    )
+    probability = classifier.predict_proba(X_test)[:, 1]
+    prediction = classifier.predict(X_test)
 
-    prediction = classifier.predict(
-        X_test
-    )
-
-    accuracy = float(
-        accuracy_score(
-            test_df["signe"],
-            prediction,
-        )
-    )
+    accuracy = float(accuracy_score(test_df["signe"], prediction))
 
     try:
-
-        auc = float(
-            roc_auc_score(
-                test_df["signe"],
-                probability,
-            )
-        )
-
+        auc = float(roc_auc_score(test_df["signe"], probability))
     except ValueError:
-
         auc = None
 
-    joblib.dump(
-        classifier,
-        output_dir / "classifier_best.joblib",
-    )
+    joblib.dump(classifier, output_dir / "classifier_best.joblib")
 
-    print(
-        f"  classifier accuracy = {accuracy:.3f}"
-    )
-
+    print(f"  classifier accuracy = {accuracy:.3f}")
     if auc is not None:
-        print(
-            f"  classifier ROC-AUC = {auc:.3f}"
-        )
+        print(f"  classifier ROC-AUC = {auc:.3f}")
+    print(f"  classifier features ({len(X_train.columns)}): {list(X_train.columns)}")
 
-    return (
-        classifier,
-        list(X_train.columns),
-        accuracy,
-        auc,
-    )
+    return classifier, list(X_train.columns), accuracy, auc
 
 
 # ---------------------------------------------------------------------
@@ -180,15 +166,9 @@ def train_price_regressor(
     df,
     product_clusters,
     client_encoding,
+    encodings,
     output_dir,
 ):
-
-    # ==============================================================
-    # Predict COEFFICIENT = prix / coût, then prix = coeff * coût.
-    # This scales correctly across cost levels (unlike predicting
-    # absolute euros on a sparse / skewed cost distribution).
-    # Outlier coefficients are clipped so one bad row cannot dominate.
-    # ==============================================================
 
     reg_df = df[
         (df["signe"] == 1)
@@ -203,7 +183,6 @@ def train_price_regressor(
         / reg_df["cout_total"].astype(float)
     )
 
-    # Drop pathological outliers (data errors / incomplete extractions)
     before = len(reg_df)
     reg_df = reg_df[
         (reg_df["coeff"] >= 0.80)
@@ -224,13 +203,15 @@ def train_price_regressor(
         random_state=RANDOM_STATE,
     )
 
-    # Cost is still a useful feature (volume effects), but target is coeff.
+    kwargs = _feature_kwargs(encodings)
+
     X_train = features.build_feature_matrix(
         train_df,
         product_clusters,
         client_encoding,
         include_cost=True,
         log_cost=True,
+        **kwargs,
     )
 
     X_test = features.build_feature_matrix(
@@ -239,6 +220,7 @@ def train_price_regressor(
         client_encoding,
         include_cost=True,
         log_cost=True,
+        **kwargs,
     )
 
     y_train = train_df["coeff"].astype(float)
@@ -254,20 +236,9 @@ def train_price_regressor(
         random_state=RANDOM_STATE,
     )
 
-    best = HistGradientBoostingRegressor(
-        loss="squared_error",
-        **params,
-    )
-    lower = HistGradientBoostingRegressor(
-        loss="quantile",
-        quantile=0.10,
-        **params,
-    )
-    upper = HistGradientBoostingRegressor(
-        loss="quantile",
-        quantile=0.90,
-        **params,
-    )
+    best = HistGradientBoostingRegressor(loss="squared_error", **params)
+    lower = HistGradientBoostingRegressor(loss="quantile", quantile=0.10, **params)
+    upper = HistGradientBoostingRegressor(loss="quantile", quantile=0.90, **params)
 
     best.fit(X_train, y_train)
     lower.fit(X_train, y_train)
@@ -323,101 +294,57 @@ def train_price_regressor(
 def train_source(source):
 
     print("\n" + "=" * 60)
-    print(
-        f"TRAINING {source.upper()}"
-    )
+    print(f"TRAINING {source.upper()}")
     print("=" * 60)
 
-    df = features.build_source(
-        source
-    )
+    df = features.build_source(source)
 
     if len(df) < 30:
-
-        print(
-            f"[SKIP] only {len(df)} rows"
-        )
-
+        print(f"[SKIP] only {len(df)} rows")
         return
 
-    print(
-        f"rows = {len(df)}"
+    print(f"rows = {len(df)}")
+    print(f"acceptance = {df['signe'].mean():.1%}")
+
+    for col in ["matiere", "month"]:
+        if col in df.columns:
+            nn = int(df[col].notna().sum())
+            print(f"  {col}: {nn}/{len(df)} ({100*nn/len(df):.0f}%)")
+
+    output_dir = MODELS_DIR / source
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_df, test_df = split_data(df)
+
+    product_clusters = features.fit_product_clusters(train_df["produit"])
+    client_encoding = features.fit_client_encoding(train_df["client"], train_df["signe"])
+    encodings = _fit_extra_encodings(train_df)
+
+    with open(output_dir / "product_clusters.json", "w", encoding="utf-8") as f:
+        json.dump(product_clusters, f, ensure_ascii=False, indent=2)
+
+    with open(output_dir / "client_encoding.json", "w", encoding="utf-8") as f:
+        json.dump(client_encoding, f, ensure_ascii=False, indent=2)
+
+    for name, mapping in encodings.items():
+        with open(output_dir / f"{name}.json", "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+    classifier, classifier_features, accuracy, auc = train_classifier(
+        source,
+        train_df,
+        test_df,
+        product_clusters,
+        client_encoding,
+        encodings,
+        output_dir,
     )
 
-    print(
-        f"acceptance = "
-        f"{df['signe'].mean():.1%}"
-    )
-
-    output_dir = (
-        MODELS_DIR
-        / source
-    )
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    train_df, test_df = split_data(
-        df
-    )
-
-    product_clusters = (
-        features.fit_product_clusters(
-            train_df["produit"]
-        )
-    )
-
-    client_encoding = (
-        features.fit_client_encoding(
-            train_df["client"],
-            train_df["signe"],
-        )
-    )
-
-    with open(
-        output_dir / "product_clusters.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        json.dump(
-            product_clusters,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    with open(
-        output_dir / "client_encoding.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        json.dump(
-            client_encoding,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    classifier, classifier_features, accuracy, auc = (
-        train_classifier(
-            source,
-            train_df,
-            test_df,
-            product_clusters,
-            client_encoding,
-            output_dir,
-        )
-    )
-
-    # Primary: coefficient → price regressor (requires cout_total).
     reg_metrics = train_price_regressor(
         df,
         product_clusters,
         client_encoding,
+        encodings,
         output_dir,
     )
 
@@ -430,9 +357,7 @@ def train_source(source):
         "n_total": int(len(df)),
         "n_train": int(len(train_df)),
         "n_test": int(len(test_df)),
-        "acceptance_rate": float(
-            df["signe"].mean()
-        ),
+        "acceptance_rate": float(df["signe"].mean()),
         "classifier": {
             "accuracy": accuracy,
             "roc_auc": auc,
@@ -442,56 +367,26 @@ def train_source(source):
         "regressor_target": target,
         "regressor_mode": mode,
         "target_transform": transform,
+        "extra_encodings": list(encodings.keys()),
     }
 
-    with open(
-        output_dir / "regressor_target.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-
+    with open(output_dir / "regressor_target.json", "w", encoding="utf-8") as f:
         json.dump(
-            {
-                "target": target,
-                "mode": mode,
-                "target_transform": transform,
-            },
+            {"target": target, "mode": mode, "target_transform": transform},
             f,
             indent=2,
         )
 
-    with open(
-        output_dir / "metrics.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
+    with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-        json.dump(
-            metrics,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    print(
-        f"Models saved to {output_dir}"
-    )
+    print(f"Models saved to {output_dir}")
 
 
 def main():
-
-    MODELS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    train_source(
-        "ponceblanc"
-    )
-
-    train_source(
-        "lbfi"
-    )
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    train_source("ponceblanc")
+    train_source("lbfi")
 
 
 if __name__ == "__main__":

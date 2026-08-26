@@ -30,6 +30,8 @@ from predict import QuoteEstimator
 
 st.set_page_config(page_title="Estimateur d'offres", layout="wide")
 
+
+
 MODELS_DIR = Path("models")
 
 NBSP = "\u202f"  # narrow no-break space, standard French thousands separator
@@ -52,7 +54,7 @@ def fmt_eur(x: float | int | None, decimals: int = 0) -> str:
 
 
 @st.cache_resource
-def get_estimator(_version: int = 9):
+def get_estimator(_version: int = 11):
     return QuoteEstimator()
 
 
@@ -88,6 +90,45 @@ def get_encodings(source: str) -> tuple[dict | None, dict | None]:
         ce = json.loads((d / "client_encoding.json").read_text(encoding="utf-8"))
 
     return pc, ce
+
+
+
+@st.cache_data(show_spinner=False)
+def cached_recommend(
+    source: str,
+    client: str,
+    produit: str,
+    quantite: float,
+    cout_total: float,
+    matiere: str | None,
+    month: int,
+    year: int,
+    _version: int = 11,
+):
+    """Cache price recommendation for identical inputs (fast UI)."""
+    est = get_estimator()
+    rec = est.recommend_price(
+        client=client,
+        produit=produit,
+        quantite=quantite,
+        source=source,
+        cout_total=cout_total,
+        matiere=matiere,
+        month=month,
+        year=year,
+    )
+    proba = est.predict_acceptance_proba(
+        client=client,
+        produit=produit,
+        quantite=quantite,
+        source=source,
+        cout_total=cout_total,
+        prix_total=float(rec["prix_median"]),
+        matiere=matiere,
+        month=month,
+        year=year,
+    )
+    return rec, float(proba)
 
 
 def clean_dropdown_values(
@@ -285,15 +326,15 @@ if page == "Aide à la décision":
     # Defaults chosen so the recommended price lands in a comfortable
     # acceptance zone (~70–80%) for a frequent client/product pair.
     if source == "ponceblanc":
-        preferred_client, preferred_produit = "GERFLOR", "NUANCIER"
+        preferred_client, preferred_produit = "GERFLOR", "LIASSE"
         default_qty, default_cost = 1000, 6000.0
     else:
         preferred_client, preferred_produit = "ROUGE_GORGE", "ECHANTILLONNAGE"
         default_qty, default_cost = 400, 800.0
 
-    c1, c2 = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
 
-    with c1:
+    with col_a:
         default_c = (
             preferred_client
             if preferred_client in known_clients
@@ -309,7 +350,7 @@ if page == "Aide à la décision":
             index=client_options.index(default_c),
             accept_new_options=True,
             key=f"client_{source}",
-            help="Tapez pour filtrer la liste, ou saisissez un client nouveau.",
+            help="Tapez pour filtrer la liste, ou saisissez un client.",
         )
         client = str(client).strip()
 
@@ -328,11 +369,27 @@ if page == "Aide à la décision":
             index=prod_options.index(default_p),
             accept_new_options=True,
             key=f"produit_{source}",
-            help="Tapez pour filtrer la liste, ou saisissez un produit nouveau.",
+            help="Tapez pour filtrer la liste, ou saisissez un produit.",
         )
         produit = str(produit).strip()
 
-    with c2:
+        matiere_options = clean_dropdown_values(history, "matiere")
+        if not matiere_options:
+            matiere_options = ["(non renseigné)"]
+        matiere_options = sorted(set(matiere_options), key=lambda s: str(s).lower())
+        matiere = st.selectbox(
+            "Matière",
+            options=matiere_options,
+            index=0,
+            accept_new_options=True,
+            key=f"matiere_{source}",
+            help="Feature modèle (Ponceblanc). Sur LBFI souvent non disponible → manquant.",
+        )
+        format_ = None
+        fournisseur = None
+
+
+    with col_b:
         quantite = st.number_input(
             "Quantité (Nb exemplaires)",
             min_value=1,
@@ -341,19 +398,100 @@ if page == "Aide à la décision":
             key=f"quantite_{source}",
         )
 
-        cout_total = st.number_input(
-            "Coût total du devis (€)",
+        cout_achat = st.number_input(
+            "Coût achat (€)",
             min_value=0.0,
-            value=default_cost,
+            value=default_cost * 0.40,
+            step=10.0,
+            key=f"achat_{source}",
+        )
+
+        cout_fabrication = st.number_input(
+            "Coût fabrication (€)",
+            min_value=0.0,
+            value=default_cost * 0.25,
+            step=10.0,
+            key=f"fabrication_{source}",
+        )
+
+        cout_transport = st.number_input(
+            "Coût transport (€)",
+            min_value=0.0,
+            value=default_cost * 0.15,
+            step=10.0,
+            key=f"transport_{source}",
+        )
+
+    with col_c:
+        cout_total = (
+            cout_achat
+            + cout_fabrication
+            + cout_transport
+        )
+
+        st.number_input(
+            "Coût total calculé (€)",
+            min_value=0.0,
+            value=float(cout_total),
             step=10.0,
             key=f"cout_{source}",
-            help=(
-                "Achat + fabrication + transport pour l'ensemble du devis. "
-                "Saisissez le montant en chiffres seuls, sans espace ni virgule "
-                "de séparation des milliers (ex. 19172, pas 19 172 ni 19,172)."
-            ),
+            disabled=True,
+            help="Total reconstruit à partir des coûts détaillés.",
         )
+
+        date_devis = st.date_input(
+            "Date du devis",
+            key=f"date_{source}",
+            help="Utilisée pour le mois / trimestre (features apprises du modèle).",
+        )
+
+        period_mode = st.radio(
+            "Période pour le modèle",
+            options=["Mois", "Trimestre"],
+            horizontal=True,
+            key=f"period_mode_{source}",
+            help="Le modèle a appris la saisonnalité sur le mois du devis. "
+                 "Trimestre = mois du milieu du trimestre (fév / mai / août / nov).",
+        )
+
+        month_names = {
+            1: "Janvier", 2: "Février", 3: "Mars", 4: "Avril",
+            5: "Mai", 6: "Juin", 7: "Juillet", 8: "Août",
+            9: "Septembre", 10: "Octobre", 11: "Novembre", 12: "Décembre",
+        }
+        if period_mode == "Mois":
+            month = st.selectbox(
+                "Mois du devis",
+                options=list(range(1, 13)),
+                format_func=lambda m: month_names[m],
+                index=(date_devis.month - 1) if date_devis else 0,
+                key=f"month_{source}",
+            )
+        else:
+            trimestre = st.selectbox(
+                "Trimestre du devis",
+                options=[1, 2, 3, 4],
+                format_func=lambda q: f"T{q} ({month_names[q*3-2][:3]}–{month_names[q*3][:3]})",
+                index=((date_devis.month - 1) // 3) if date_devis else 0,
+                key=f"trimestre_{source}",
+            )
+            # Mid-quarter month so sin/cos match the trimester
+            month = {1: 2, 2: 5, 3: 8, 4: 11}[int(trimestre)]
+
+        year = int(date_devis.year) if date_devis else 2024
+
+        # No manual heuristics — season comes only from month/trimester above
+        saison = None
+        pression_concurrentielle = None
+        marge_cible = None
+        delai_livraison = None
+
         prix_candidat = None
+
+    st.caption(
+        "Entrées modèle : client, type de produit, matière, quantité, "
+        "coûts (achat + fabrication + transport), date → mois/trimestre (saison)."
+    )
 
     with st.expander("Filtres pour l'historique comparable (n'entraînent pas le modèle)"):
         f1, f2, f3 = st.columns(3)
@@ -386,6 +524,12 @@ if page == "Aide à la décision":
 
     stats = source_stats(similar, source)
 
+    if stats["n"] < min_n_hint:
+        st.warning(
+            f"Seulement {stats['n']} devis similaires après filtres (seuil : {min_n_hint}). "
+            "Le prix est donc basé sur un échantillon faible, et la recommandation doit être interprétée avec prudence."
+        )
+
     st.header("2. Proposition du modèle")
 
     if cout_total <= 0:
@@ -393,24 +537,17 @@ if page == "Aide à la décision":
         st.stop()
 
     try:
-        rec = est.recommend_price(
+        rec, proba_reco = cached_recommend(
+            source=source,
             client=client,
             produit=produit,
-            quantite=quantite,
-            source=source,
-            cout_total=cout_total,
+            quantite=float(quantite),
+            cout_total=float(cout_total),
+            matiere=matiere,
+            month=int(month),
+            year=int(year),
         )
-
         prix_recommande = float(rec["prix_median"])
-
-        proba_reco = est.predict_acceptance_proba(
-            client=client,
-            produit=produit,
-            quantite=quantite,
-            source=source,
-            cout_total=cout_total,
-            prix_total=prix_recommande,
-        )
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Prix recommandé", fmt_eur(prix_recommande))
@@ -444,36 +581,44 @@ if page == "Aide à la décision":
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.markdown("**Signaux que le modèle utilise**")
+        st.markdown("**Signaux du modèle**")
         bullets = []
-
         if client_encoding:
             client_rate = client_encoding.get(client_key, client_encoding.get("__GLOBAL__"))
             global_rate = client_encoding.get("__GLOBAL__", metrics["acceptance_rate"] if metrics else None)
             if client_key in client_encoding:
-                bullets.append(f"- **Client `{client_key}`** : taux historique lissé ≈ **{client_rate:.0%}**.")
+                bullets.append(f"- **Client {client_key}** : taux d'acceptation lissé ≈ **{client_rate:.0%}**.")
             else:
-                bullets.append(f"- **Client `{client_key}` inconnu** : taux global appliqué (≈ **{global_rate:.0%}**).")
-
+                bullets.append(f"- **Client {client_key} inconnu** : taux global ≈ **{global_rate:.0%}**.")
         if product_clusters:
             if produit_key in product_clusters:
-                bullets.append(f"- **Produit `{produit_key}`** : cluster #{product_clusters[produit_key]}.")
+                bullets.append(f"- **Type produit {produit_key}** : cluster #{product_clusters[produit_key]}.")
             else:
-                bullets.append(f"- **Produit `{produit_key}`** : cluster « autres » (produit rare/nouveau).")
-
-        bullets.append(f"- **Quantité {quantite}** : prend en compte l'effet de volume.")
-        bullets.append(f"- **Coût total {fmt_eur(cout_total)}** : entrée du régresseur (coeff × coût → prix).")
-
+                bullets.append(f"- **Type produit {produit_key}** : rare → profil plus volatil.")
+        bullets.append(f"- **Quantité** : {quantite}")
+        bullets.append(f"- **Coût total** : {fmt_eur(cout_total)} (achat + fab + transport)")
+        if matiere:
+            bullets.append(f"- **Matière** : {matiere}")
+        bullets.append(f"- **Saison** : mois={month}, trimestre={int((month-1)//3)+1}, année={year}")
         st.markdown("\n".join(bullets))
 
     with col_b:
-        st.markdown("**Ce que la recommandation représente**")
         label = "Ponceblanc" if source == "ponceblanc" else "LBFI"
+        auc = (metrics or {}).get("classifier", {}).get("roc_auc")
+        auc_txt = f"{auc:.3f}" if auc is not None else "n/a"
+        st.markdown("**Lecture**")
         st.markdown(
             f"""
-Le modèle **{label}** prédit un **coefficient prix/coût**, converti en **prix total en euros**.
-- **{fmt_eur(prix_recommande)}** = montant typique parmi les devis **acceptés** pour ce coût et ce profil.
-- Le coût entre en feature du régresseur ; le taux de marge n'est pas une entrée.
+Modèle **{label}** (ROC-AUC test ≈ **{auc_txt}**).
+
+Entrées **uniquement** :
+client, type de produit, matière, quantité, coût total, date → mois/trimestre.
+
+**Non utilisés** : délai offre→décision, format, commercial, pression, marge cible saisie.
+
+- Prix recommandé : **{fmt_eur(prix_recommande)}**
+- P(acceptation) : **{proba_reco:.0%}**
+- Intervalle : **{fmt_eur(rec['prix_lower'])} — {fmt_eur(rec['prix_upper'])}**
 """
         )
 
@@ -559,6 +704,15 @@ Le modèle **{label}** prédit un **coefficient prix/coût**, converti en **prix
             source=source,
             cout_total=cout_total,
             prix_total=p_val,
+            saison=saison,
+            matiere=matiere,
+            format_dims=format_,
+            fournisseur=fournisseur,
+            pression_concurrentielle=pression_concurrentielle,
+            marge_cible=marge_cible,
+            month=month,
+            year=year,
+            delai_livraison=delai_livraison,
         )
         margin = compute_margin(p_val, cout_total)
         return {
@@ -571,42 +725,45 @@ Le modèle **{label}** prédit un **coefficient prix/coût**, converti en **prix
             "Lecture": interpret_proba(proba),
         }
 
-    # Ambitieux = highest price that still keeps P(accept) at least as high
-    # as the recommended price (push revenue without worsening acceptance vs reco).
-    # Meilleure P(accept) = price that maximises acceptance probability.
+    # Fast scenarios: one batched grid, no nested max_* loops
     max_acc = None
     ambitieux_price = round(prix_recommande * 1.10, -1)
     try:
-        max_acc = est.max_acceptance_price(
-            client=client,
-            produit=produit,
-            quantite=quantite,
-            cout_total=cout_total,
-            source=source,
-            max_coeff=min(MAX_COEFF, 3.0),
-        )
-        ambitieux = est.max_price_for_threshold(
-            client=client,
-            produit=produit,
-            quantite=quantite,
-            cout_total=cout_total,
-            threshold=float(proba_reco),
-            source=source,
-            max_coeff=min(MAX_COEFF, 3.0),
-        )
-        if ambitieux.get("found"):
-            ambitieux_price = float(ambitieux["prix"])
+        grid_min = float(cout_total)
+        grid_max = float(min(cout_total * min(MAX_COEFF, 3.0), max(prix_recommande * 2.0, cout_total * 1.5), 500_000.0))
+        grid_prices = np.linspace(grid_min, grid_max, 16)
+        rows_grid = []
+        for gp in grid_prices:
+            rows_grid.append(
+                est._make_row(
+                    client, produit, quantite, source,
+                    cout_total=cout_total, prix_total=float(gp),
+                    matiere=matiere, month=month, year=year,
+                )
+            )
+        grid_df = pd.concat(rows_grid, ignore_index=True)
+        grid_probs = est._predict_acceptance_batch(grid_df, source, matiere=matiere)
+        # max acceptance
+        best_i = int(np.argmax(grid_probs + grid_prices / (grid_prices.max() + 1) * 1e-9))
+        max_acc = {
+            "prix": float(grid_prices[best_i]),
+            "proba": float(grid_probs[best_i]),
+        }
+        # ambitious: highest price with proba >= reco proba
+        feasible = grid_probs + 1e-12 >= float(proba_reco)
+        if np.any(feasible):
+            fi = int(np.where(feasible)[0][np.argmax(grid_prices[feasible])])
+            ambitieux_price = float(grid_prices[fi])
         else:
-            # No grid point matches reco proba: fall back to max-acceptance price
-            ambitieux_price = float(ambitieux["prix"])
-    except (ValueError, FileNotFoundError) as exc:
+            ambitieux_price = float(max_acc["prix"])
+    except Exception as exc:
         st.warning(f"Scénarios optimisés indisponibles : {exc}")
 
     st.caption(
-        "**Recommandé** = prix typique accepté (régresseur). "
-        "**Ambitieux** = prix **le plus haut** dont la P(accept) reste ≥ celle du recommandé "
+        "**Recommandé** = prix typique accepté (régresseur + grille). "
+        "**Ambitieux** = prix le plus haut dont la P(accept) reste ≥ celle du recommandé "
         f"({proba_reco:.0%}). "
-        "**Meilleure P(accept)** = prix qui maximise la proba (à égalité : le plus haut)."
+        "**Meilleure P(accept)** = prix qui maximise la proba."
     )
 
     anchor_prices = {
@@ -619,8 +776,6 @@ Le modèle **{label}** prédit un **coefficient prix/coût**, converti en **prix
             f"Meilleure P(accept) ({max_acc['proba']:.0%})"
         ] = float(max_acc["prix"])
 
-    # Session key is source+cost specific so a typed value for one quote
-    # does not leak into another (and absurd leftovers get wiped).
     choice_key = f"votre_choix_prix_{source}"
     cost_key = f"votre_choix_cost_{source}"
     default_choice = float(max(cout_total, round(prix_recommande, -1)))
@@ -635,16 +790,55 @@ Le modèle **{label}** prédit un **coefficient prix/coût**, converti en **prix
         st.session_state[choice_key] = default_choice
         st.session_state[cost_key] = float(cout_total)
 
-    rows = [_scenario_row(name, p_val) for name, p_val in anchor_prices.items()]
-    rows.append(_scenario_row("Votre choix", st.session_state[choice_key]))
+    # Batch scenario probabilities (one classifier call)
+    scenario_items = list(anchor_prices.items()) + [("Votre choix", st.session_state[choice_key])]
+    scen_prices = np.array([float(v) for _, v in scenario_items], dtype=float)
+    try:
+        scen_rows = [
+            est._make_row(
+                client, produit, quantite, source,
+                cout_total=cout_total, prix_total=float(pv),
+                matiere=matiere, month=month, year=year,
+            )
+            for pv in scen_prices
+        ]
+        scen_probs = est._predict_acceptance_batch(
+            pd.concat(scen_rows, ignore_index=True), source, matiere=matiere
+        )
+    except Exception:
+        scen_probs = np.full(len(scen_prices), np.nan)
+
+    rows = []
+    for i, (name, p_val) in enumerate(scenario_items):
+        p_val = float(p_val)
+        margin = compute_margin(p_val, cout_total)
+        if p_val < cout_total:
+            rows.append({
+                "Scénario": name,
+                "Prix de vente total (€)": p_val,
+                "Marge (€)": margin["marge_eur"],
+                "Taux de marge": margin["coefficient"],
+                "P(acceptation)": "n/a",
+                "Risque": "—",
+                "Lecture": f"⚠️ Prix inférieur au coût ({fmt_eur(cout_total)}).",
+            })
+            continue
+        proba = float(scen_probs[i]) if np.isfinite(scen_probs[i]) else 0.0
+        rows.append({
+            "Scénario": name,
+            "Prix de vente total (€)": p_val,
+            "Marge (€)": margin["marge_eur"],
+            "Taux de marge": margin["coefficient"],
+            "P(acceptation)": f"{proba:.0%}",
+            "Risque": risk_label(proba),
+            "Lecture": interpret_proba(proba),
+        })
 
     display_df = pd.DataFrame(rows)
 
-    target_note = "Le régresseur actif prédit le **coefficient / prix** (coût en feature)."
     st.caption(
-        "Modifiez le prix de la ligne **Votre choix** pour tester un montant précis ; les autres lignes "
-        f"sont fixées par le modèle. {target_note} "
-        f"Plafond UI : {fmt_eur(MAX_PRICE)} (≈ {MAX_COEFF:.0f}× le coût)."
+        "Modifiez le prix de la ligne **Votre choix** pour tester un montant précis. "
+        f"Plafond UI : {fmt_eur(MAX_PRICE)}."
     )
 
     edited_df = st.data_editor(
@@ -673,37 +867,40 @@ Le modèle **{label}** prédit un **coefficient prix/coût**, converti en **prix
     new_choice_price = float(
         edited_df.loc[edited_df["Scénario"] == "Votre choix", "Prix de vente total (€)"].iloc[0]
     )
-    # Clamp anything the widget still lets through
     new_choice_price = max(MIN_PRICE, min(float(MAX_PRICE), new_choice_price))
     if abs(new_choice_price - float(st.session_state[choice_key])) > 0.01:
         st.session_state[choice_key] = new_choice_price
         st.rerun()
 
-
-    # Sensibilité
+    # Sensibilité — only compute when expander is open (saves a full grid on every tweak)
     st.subheader("5. Sensibilité")
-    st.caption(
-        f"Le coût total reste fixé à **{fmt_eur(cout_total)}**. La courbe fait varier "
-        f"uniquement le **prix de vente total (€)** facturé au client, et montre "
-        f"comment la probabilité d'acceptation évolue selon ce prix."
-    )
-    step_val = st.number_input("Pas de variation du prix de vente (€)", min_value=5.0, value=50.0, step=10.0)
-    try:
-        curve = est.optimize_price(
-            client=client,
-            produit=produit,
-            quantite=quantite,
-            cout_total=cout_total,
-            step=step_val,
-            source=source,
+    with st.expander("Afficher la courbe P(acceptation) vs prix", expanded=False):
+        st.caption(
+            f"Coût fixé à **{fmt_eur(cout_total)}**. Variation du prix de vente total uniquement."
         )
-        chart = curve.set_index("prix_total")[["acceptance_proba"]].rename(
-            columns={"acceptance_proba": "P(acceptation)"}
+        step_val = st.number_input(
+            "Pas de variation du prix (€)", min_value=5.0, value=100.0, step=10.0,
+            key=f"step_sens_{source}",
         )
-        chart.index.name = "Prix de vente total (€)"
-        st.line_chart(chart)
-    except (ValueError, AttributeError) as exc:
-        st.error(str(exc))
+        try:
+            curve = est.optimize_price(
+                client=client,
+                produit=produit,
+                quantite=quantite,
+                cout_total=cout_total,
+                step=step_val,
+                source=source,
+                matiere=matiere,
+                month=month,
+                year=year,
+            )
+            chart = curve.set_index("prix_total")[["acceptance_proba"]].rename(
+                columns={"acceptance_proba": "P(acceptation)"}
+            )
+            chart.index.name = "Prix de vente total (€)"
+            st.line_chart(chart)
+        except (ValueError, AttributeError) as exc:
+            st.error(str(exc))
 
     # History Table
     st.subheader("6. Devis historiques comparables")
@@ -729,48 +926,115 @@ Le modèle **{label}** prédit un **coefficient prix/coût**, converti en **prix
 elif page == "Performance des modèles":
 
     st.title("Performance des modèles")
+    st.caption(
+        "Évaluation alignée sur `eval_models.py` : split test 20 %, "
+        "même features finales (client, produit, matière, quantité, coût, saison mois/trimestre)."
+    )
+
+    run_live = st.checkbox(
+        "Recalculer sur le jeu de test (eval_models) — plus lent",
+        value=False,
+        help="Sinon : lit metrics.json sauvegardé à l'entraînement (instantané).",
+    )
 
     for src in ("ponceblanc", "lbfi"):
-        title = {
-            "ponceblanc": "PONCEBLANC",
-            "lbfi": "LBFI",
-        }.get(src, src.upper())
+        title = "PONCEBLANC" if src == "ponceblanc" else "LBFI"
         st.subheader(title)
-        metrics = get_metrics(src)
 
-        if not metrics:
-            st.warning(f"metrics.json introuvable pour {src}.")
+        live = None
+        if run_live:
+            try:
+                import eval_models
+                with st.spinner(f"Évaluation {src}…"):
+                    live = eval_models.evaluate_source(src)
+            except Exception as exc:
+                st.error(f"Évaluation live impossible : {exc}")
+                live = None
+
+        metrics = get_metrics(src)
+        if live is None and not metrics:
+            st.warning(f"metrics.json introuvable pour {src}. Lancez train_models.py.")
             continue
 
-        classifier = metrics.get("classifier") or {}
-        regressor = metrics.get("margin_regressor") or {}
+        # Prefer live eval numbers when available
+        if live is not None:
+            n_total = live["n_total"]
+            acc_rate = live["acceptance_rate"]
+            clf = live["classifier"]
+            reg = live["regressor"]
+        else:
+            n_total = metrics.get("n_total", 0)
+            acc_rate = metrics.get("acceptance_rate", 0)
+            clf = metrics.get("classifier") or {}
+            reg_m = metrics.get("margin_regressor") or {}
+            reg = {
+                "n_rows": reg_m.get("n_rows"),
+                "mae_eur": reg_m.get("mae"),
+                "r2_eur": None,
+                "mae_coeff": reg_m.get("mae_coeff"),
+                "r2_coeff": None,
+                "actual_price_mean": None,
+                "predicted_price_mean": None,
+                "features": reg_m.get("features") or [],
+            }
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Devis utilisables", f"{metrics.get('n_total', 0):,}")
-        c2.metric("Taux acceptation global", f"{metrics.get('acceptance_rate', 0):.0%}")
-        c3.metric("Accuracy (test)", f"{classifier.get('accuracy', 0):.1%}")
-        auc = classifier.get("roc_auc")
-        c4.metric("ROC-AUC (test)", f"{auc:.3f}" if auc else "n/a")
+        c1.metric("Devis utilisables", f"{n_total:,}")
+        c2.metric("Taux acceptation", f"{acc_rate:.0%}")
+        c3.metric("Accuracy (test)", f"{clf.get('accuracy', 0):.1%}")
+        auc = clf.get("roc_auc")
+        c4.metric("ROC-AUC (test)", f"{auc:.3f}" if auc is not None else "n/a")
 
-        mode = regressor.get("mode") or metrics.get("regressor_mode") or "—"
-        target = regressor.get("target") or metrics.get("regressor_target") or "—"
-        st.write(f"Cible régresseur : **{target}** — mode **{mode}**")
-        mae = regressor.get("mae")
-        mae_c = regressor.get("mae_coeff")
-        if mae is not None:
-            st.write(f"MAE prix (sur acceptés) : **{fmt_eur(mae, decimals=0)}**")
-        if mae_c is not None:
-            st.write(f"MAE coefficient : **{mae_c:.3f}**")
-        n_reg = regressor.get("n_rows")
-        if n_reg is not None:
-            st.caption(f"Lignes utilisées pour le régresseur (acceptés avec coût) : {n_reg:,}")
-        st.caption(
-            "Entrées du régresseur : quantite, cluster produit, client encodé, cout_total. "
-            "Le coefficient / taux n'est pas une entrée — il est prédit puis multiplié par le coût."
+        st.markdown("#### Classifieur — P(acceptation)")
+        report = clf.get("report")
+        if report:
+            # compact table like classification_report
+            rows = []
+            for label in ("0", "1"):
+                if label in report:
+                    r = report[label]
+                    rows.append({
+                        "Classe": "Refusé" if label == "0" else "Accepté",
+                        "Precision": f"{r['precision']:.3f}",
+                        "Recall": f"{r['recall']:.3f}",
+                        "F1": f"{r['f1-score']:.3f}"
+                    })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        feats = clf.get("features") or []
+        if feats:
+            st.caption("Features classifieur : " + ", ".join(feats))
+
+        st.markdown("#### Régresseur de prix (coefficient × coût)")
+        st.write(
+            "Cible : **coefficient** = prix / coût sur devis **acceptés** "
+            "(mode `coeff_times_cost`). Le prix affiché = coefficient × coût."
         )
+        r1, r2, r3, r4 = st.columns(4)
+        if reg.get("mae_eur") is not None:
+            r1.metric("MAE prix (€)", fmt_eur(reg["mae_eur"], decimals=0))
+        if reg.get("r2_eur") is not None:
+            r2.metric("R² prix (€)", f"{reg['r2_eur']:.3f}")
+        if reg.get("mae_coeff") is not None:
+            r3.metric("MAE coefficient", f"{reg['mae_coeff']:.4f}")
+        if reg.get("r2_coeff") is not None:
+            r4.metric("R² coefficient", f"{reg['r2_coeff']:.3f}")
+
+        means = []
+        if reg.get("actual_price_mean") is not None:
+            means.append(f"Prix réel moyen (test) : **{fmt_eur(reg['actual_price_mean'])}**")
+        if reg.get("predicted_price_mean") is not None:
+            means.append(f"Prix prédit moyen (test) : **{fmt_eur(reg['predicted_price_mean'])}**")
+        if reg.get("n_rows") is not None:
+            means.append(f"Lignes régresseur (acceptés avec coût) : **{reg['n_rows']:,}**")
+        if means:
+            st.markdown(" · ".join(means))
+
+        reg_feats = reg.get("features") or []
+        if reg_feats:
+            st.caption("Features régresseur : " + ", ".join(reg_feats))
 
         st.divider()
-
 
 # ===========================================================================
 # PAGE 3 — Guide
@@ -795,8 +1059,10 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 | **Source** | Ponceblanc ou LBFI (modèles entraînés séparément) |
 | **Client** | Nom client (liste historique + saisie libre) |
 | **Produit / type** | Type de produit |
+| **Matière** | Support / matière (feature modèle) |
 | **Quantité** | Nombre d'exemplaires |
-| **Coût total (€)** | Achat + fabrication + transport pour tout le devis |
+| **Coût (€)** | Achat + fabrication + transport → total |
+| **Date** | → mois / trimestre (saison) |
 
 ## Ce que le modèle renvoie
 
@@ -813,19 +1079,27 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 - **Classifieur** : estime P(acceptation | client, produit, quantité, coût, prix candidat).
 - Les taux de marge affichés sont **uniquement pour lecture** ; ils ne sont pas des entrées du modèle.
 
-## Limites à garder en tête
+## Entrées du modèle (liste finale)
+
+| Champ | Rôle |
+|-------|------|
+| Client | taux d'acceptation lissé |
+| Type de produit | cluster |
+| Matière | code catégorie (+ manquant explicite) |
+| Quantité | volume |
+| Coût total | achat + fabrication + transport |
+| Date → mois / trimestre | saisonnalité |
+| Prix candidat | classifieur uniquement (P(accept)) |
+
+**Non utilisés** : délai offre→décision (ne pilote pas la décision client), format, commercial, heuristiques pression / marge cible.
+
+## Limites
 
 - Peu d'historique pour un client / produit rare → confiance plus faible.
 - Prix très éloignés du coût (coeff > ~3–5×) sont hors zone d'entraînement.
-- Le modèle ne remplace pas le jugement commercial ; il quantifie l'habitude historique.
+- Matière ~34 % de couverture seulement (catégorie « manquant » explicite).
+- Le modèle ne remplace pas le jugement commercial.
 
-## Lancer l'application
-
-```bash
-cd <dossier_du_projet>
-pip install -r requirements.txt
-streamlit run vis.py
-```
 """
     )
 

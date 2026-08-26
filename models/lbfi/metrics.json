@@ -5,12 +5,31 @@
   "n_test": 1227,
   "acceptance_rate": 0.3094111890393084,
   "classifier": {
-    "accuracy": 0.7383863080684596,
-    "roc_auc": 0.7683915366929721,
+    "accuracy": 0.7636511817440913,
+    "roc_auc": 0.823811595103461,
     "features": [
       "quantite",
       "produit_cluster",
       "client_encoded",
+      "month",
+      "month_sin",
+      "month_cos",
+      "month_known",
+      "year",
+      "year_known",
+      "log_longueur",
+      "longueur_known",
+      "log_largeur",
+      "largeur_known",
+      "log_area",
+      "area_known",
+      "matiere_code",
+      "matiere_known",
+      "format_code",
+      "format_known",
+      "commercial_code",
+      "commercial_known",
+      "commercial_rate",
       "cout_total",
       "prix_total"
     ]
@@ -19,13 +38,32 @@
     "target": "coefficient",
     "mode": "coeff_times_cost",
     "target_transform": "identity",
-    "mae": 183.64102695210045,
-    "mae_coeff": 0.08378710584807643,
+    "mae": 164.3451872750248,
+    "mae_coeff": 0.07484637967813008,
     "n_rows": 1857,
     "features": [
       "quantite",
       "produit_cluster",
       "client_encoded",
+      "month",
+      "month_sin",
+      "month_cos",
+      "month_known",
+      "year",
+      "year_known",
+      "log_longueur",
+      "longueur_known",
+      "log_largeur",
+      "largeur_known",
+      "log_area",
+      "area_known",
+      "matiere_code",
+      "matiere_known",
+      "format_code",
+      "format_known",
+      "commercial_code",
+      "commercial_known",
+      "commercial_rate",
       "cout_total"
     ],
     "coeff_training": {
@@ -43,5 +81,8 @@
   },
   "regressor_target": "coefficient",
   "regressor_mode": "coeff_times_cost",
-  "target_transform": "identity"
+  "target_transform": "identity",
+  "extra_encodings": [
+    "matiere_encoding"
+  ]
 }

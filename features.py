@@ -16,11 +16,15 @@ Both sources use the same EURO workflow when cost data is available:
         - quantite
         - cout_total (€)
         - candidate prix_total (€), when evaluating acceptance
+        - plus available context: matiere, format_dims, commercial,
+          month/year, longueur/largeur, delai_jours (when present in source data)
 
     Target for the price model:
-        - prix_total (€)
+        - coefficient = prix_total / cout_total on accepted quotes
+          (price is recovered as coefficient × cout_total)
 
-    Margin rates / coefficients are display-only and never fed into the models.
+    Margin rates / coefficients are display-only and never fed into the models
+    as targets; they may appear as derived features only when grounded in data.
 """
 
 from __future__ import annotations
@@ -68,6 +72,14 @@ UNIFIED_COLUMNS = [
     "delai_jours",
     "cout_total",
     "signe",
+    # Extra signals when available in the source extract
+    "matiere",
+    "format_dims",
+    "commercial",
+    "month",
+    "year",
+    "longueur",
+    "largeur",
 ]
 
 VALID_SOURCES = ("ponceblanc", "lbfi")
@@ -363,8 +375,33 @@ def _clean_text(
         .astype(str)
         .str.strip()
         .str.upper()
-        .replace({"NAN": np.nan})
+        .replace({"NAN": np.nan, "NONE": np.nan, "": np.nan})
     )
+
+
+def _normalize_format(series: pd.Series) -> pd.Series:
+    """Normalize FORMAT strings: collapse spaces/x/X variants."""
+    s = series.astype(str).str.strip().str.upper()
+    s = s.str.replace(r"\s*[xX×]\s*", "X", regex=True)
+    s = s.str.replace(r"\s+", "", regex=True)
+    s = s.replace({"NAN": np.nan, "NONE": np.nan, "": np.nan})
+    return s
+
+
+def _excel_serial_to_month_year(series: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Handle Excel serial dates or already-parsed datetimes."""
+    # Try datetime first
+    dt = pd.to_datetime(series, errors="coerce", dayfirst=True, format="mixed")
+    # Excel serial numbers (rough range 2000-2035 → ~36526–62000)
+    numeric = pd.to_numeric(series, errors="coerce")
+    serial_mask = numeric.notna() & (numeric > 30000) & (numeric < 70000) & dt.isna()
+    if serial_mask.any():
+        # Excel epoch 1899-12-30
+        origin = pd.Timestamp("1899-12-30")
+        dt.loc[serial_mask] = origin + pd.to_timedelta(numeric.loc[serial_mask], unit="D")
+    month = dt.dt.month
+    year = dt.dt.year
+    return month, year
 
 
 # ---------------------------------------------------------------------
@@ -451,6 +488,38 @@ def standardize_ponceblanc(
         errors="coerce",
     )
 
+    # --- Extra signals (Ponceblanc-rich) ---
+    if "Matière" in df.columns:
+        out["matiere"] = _clean_text(df["Matière"])
+    else:
+        out["matiere"] = np.nan
+
+    if "FORMAT" in df.columns:
+        out["format_dims"] = _normalize_format(df["FORMAT"])
+    else:
+        out["format_dims"] = np.nan
+
+    if "Commercial" in df.columns:
+        out["commercial"] = _clean_text(df["Commercial"])
+    else:
+        out["commercial"] = np.nan
+
+    # Month / year from Mois devis / Année Devis or Dates serial
+    if "Mois devis" in df.columns and "Année Devis" in df.columns:
+        out["month"] = pd.to_numeric(df["Mois devis"], errors="coerce")
+        out["year"] = pd.to_numeric(df["Année Devis"], errors="coerce")
+    elif "Dates" in df.columns:
+        m, y = _excel_serial_to_month_year(df["Dates"])
+        out["month"] = m
+        out["year"] = y
+    else:
+        out["month"] = np.nan
+        out["year"] = np.nan
+
+    # No longueur/largeur on Ponceblanc extract
+    out["longueur"] = np.nan
+    out["largeur"] = np.nan
+
     return out
 
 
@@ -473,6 +542,7 @@ def standardize_lbfi(
         prix_total = selling price
 
     Both are absolute EUR amounts.
+    Extra signals when present: Date devis → month/year, Longueur, Largeur.
     """
 
     out = pd.DataFrame()
@@ -596,6 +666,29 @@ def standardize_lbfi(
 
     out["signe"] = mapped
 
+    # --- Extra signals (LBFI) ---
+    out["matiere"] = np.nan  # not in extract
+    out["format_dims"] = np.nan
+    out["commercial"] = np.nan
+
+    if "Date devis" in df.columns:
+        m, y = _excel_serial_to_month_year(df["Date devis"])
+        out["month"] = m
+        out["year"] = y
+    else:
+        out["month"] = np.nan
+        out["year"] = np.nan
+
+    if "Longueur" in df.columns:
+        out["longueur"] = pd.to_numeric(df["Longueur"], errors="coerce")
+    else:
+        out["longueur"] = np.nan
+
+    if "Largeur" in df.columns:
+        out["largeur"] = pd.to_numeric(df["Largeur"], errors="coerce")
+    else:
+        out["largeur"] = np.nan
+
     return out
 
 
@@ -606,6 +699,11 @@ def standardize_lbfi(
 def _finalize(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
+
+    # Ensure all unified columns exist
+    for col in UNIFIED_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
 
     df = df[UNIFIED_COLUMNS].copy()
 
@@ -672,6 +770,18 @@ def _finalize(
         )
 
         df.loc[bad, col] = np.nan
+
+    # Clip dimensions to realistic range
+    for col, lo, hi in (
+        ("longueur", 0, 50_000),
+        ("largeur", 0, 50_000),
+        ("month", 1, 12),
+        ("year", 2015, 2035),
+        ("delai_jours", 0, 365),
+    ):
+        if col in df.columns:
+            bad = df[col].notna() & ~df[col].between(lo, hi)
+            df.loc[bad, col] = np.nan
 
     return df.reset_index(drop=True)
 
@@ -826,6 +936,85 @@ def apply_client_encoding(
     )
 
 
+def fit_categorical_encoding(
+    series: pd.Series,
+    min_count: int = 10,
+) -> dict:
+    """
+    Integer codes for categorical columns.
+    Rare values → __OTHER__; missing → __MISSING__.
+    """
+    cleaned = series.fillna("__MISSING__").astype(str).str.strip().str.upper()
+    cleaned = cleaned.replace({"": "__MISSING__", "NAN": "__MISSING__", "NONE": "__MISSING__"})
+    counts = cleaned.value_counts()
+    frequent = counts[counts >= min_count].index.tolist()
+    # Always keep __MISSING__ as its own code if it exists
+    mapping = {}
+    idx = 0
+    for val in frequent:
+        mapping[val] = idx
+        idx += 1
+    if "__MISSING__" not in mapping:
+        mapping["__MISSING__"] = idx
+        idx += 1
+    mapping["__OTHER__"] = idx
+    return mapping
+
+
+def apply_categorical_encoding(
+    series: pd.Series,
+    mapping: dict,
+) -> pd.Series:
+    other = mapping["__OTHER__"]
+    missing = mapping.get("__MISSING__", other)
+
+    def _map(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return missing
+        key = str(v).strip().upper()
+        if key in ("", "NAN", "NONE"):
+            return missing
+        return mapping.get(key, other)
+
+    return series.map(_map)
+
+
+def fit_target_encoding(
+    series: pd.Series,
+    signe_series: pd.Series,
+    smoothing: int = 10,
+) -> dict:
+    """Smoothed acceptance rate by category (same idea as client encoding)."""
+    global_rate = float(signe_series.mean())
+    cleaned = series.fillna("__MISSING__").astype(str).str.strip().str.upper()
+    cleaned = cleaned.replace({"": "__MISSING__", "NAN": "__MISSING__", "NONE": "__MISSING__"})
+    temp = pd.DataFrame({"cat": cleaned, "signe": signe_series})
+    grouped = temp.groupby("cat")["signe"]
+    counts = grouped.count()
+    means = grouped.mean()
+    smoothed = (means * counts + global_rate * smoothing) / (counts + smoothing)
+    mapping = smoothed.to_dict()
+    mapping["__GLOBAL__"] = global_rate
+    return mapping
+
+
+def apply_target_encoding(
+    series: pd.Series,
+    mapping: dict,
+) -> pd.Series:
+    default = mapping["__GLOBAL__"]
+
+    def _map(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return mapping.get("__MISSING__", default)
+        key = str(v).strip().upper()
+        if key in ("", "NAN", "NONE"):
+            return mapping.get("__MISSING__", default)
+        return mapping.get(key, default)
+
+    return series.map(_map)
+
+
 # ---------------------------------------------------------------------
 # MODEL FEATURES
 # ---------------------------------------------------------------------
@@ -840,6 +1029,11 @@ def build_feature_matrix(
     log_cost: bool = False,
     log_price: bool = False,
     include_cost: bool = False,
+    # Optional extra encodings (fitted at train time, saved next to models)
+    matiere_encoding: dict | None = None,
+    format_encoding: dict | None = None,
+    commercial_encoding: dict | None = None,
+    commercial_target_encoding: dict | None = None,
 ) -> pd.DataFrame:
 
     X = pd.DataFrame(
@@ -864,6 +1058,80 @@ def build_feature_matrix(
             client_encoding,
         )
     )
+
+    # --- Calendar features from real month/year when available ---
+    month = pd.to_numeric(df["month"], errors="coerce") if "month" in df.columns else pd.Series(np.nan, index=df.index)
+    # Default mid-year when unknown so sin/cos stay defined
+    month_filled = month.fillna(6.0).clip(1, 12)
+    X["month"] = month_filled.astype(float)
+    X["month_sin"] = np.sin(2 * np.pi * month_filled / 12.0)
+    X["month_cos"] = np.cos(2 * np.pi * month_filled / 12.0)
+    X["month_known"] = month.notna().astype(float)
+
+    year = pd.to_numeric(df["year"], errors="coerce") if "year" in df.columns else pd.Series(np.nan, index=df.index)
+    X["year"] = year.fillna(2024.0).astype(float)
+    X["year_known"] = year.notna().astype(float)
+
+    # --- Dimensions (LBFI primarily) ---
+    if "longueur" in df.columns:
+        longueur = pd.to_numeric(df["longueur"], errors="coerce")
+        X["log_longueur"] = np.log1p(longueur.clip(lower=0).fillna(0))
+        X["longueur_known"] = longueur.notna().astype(float)
+    else:
+        X["log_longueur"] = 0.0
+        X["longueur_known"] = 0.0
+
+    if "largeur" in df.columns:
+        largeur = pd.to_numeric(df["largeur"], errors="coerce")
+        X["log_largeur"] = np.log1p(largeur.clip(lower=0).fillna(0))
+        X["largeur_known"] = largeur.notna().astype(float)
+    else:
+        X["log_largeur"] = 0.0
+        X["largeur_known"] = 0.0
+
+    # Area proxy when both dims present
+    if "longueur" in df.columns and "largeur" in df.columns:
+        L = pd.to_numeric(df["longueur"], errors="coerce")
+        W = pd.to_numeric(df["largeur"], errors="coerce")
+        area = (L * W).where(L.notna() & W.notna())
+        X["log_area"] = np.log1p(area.clip(lower=0).fillna(0))
+        X["area_known"] = area.notna().astype(float)
+    else:
+        X["log_area"] = 0.0
+        X["area_known"] = 0.0
+
+    # --- Matière (Ponceblanc; sparse → explicit missing flag + code) ---
+    if matiere_encoding is not None and "matiere" in df.columns:
+        X["matiere_code"] = apply_categorical_encoding(df["matiere"], matiere_encoding)
+        X["matiere_known"] = df["matiere"].notna().astype(float)
+    else:
+        X["matiere_code"] = 0.0
+        X["matiere_known"] = 0.0
+
+    # --- Format (Ponceblanc text dims) ---
+    if format_encoding is not None and "format_dims" in df.columns:
+        X["format_code"] = apply_categorical_encoding(df["format_dims"], format_encoding)
+        X["format_known"] = df["format_dims"].notna().astype(float)
+    else:
+        X["format_code"] = 0.0
+        X["format_known"] = 0.0
+
+    # --- Commercial (Ponceblanc; high coverage → target-encode + code) ---
+    if commercial_encoding is not None and "commercial" in df.columns:
+        X["commercial_code"] = apply_categorical_encoding(df["commercial"], commercial_encoding)
+        X["commercial_known"] = df["commercial"].notna().astype(float)
+    else:
+        X["commercial_code"] = 0.0
+        X["commercial_known"] = 0.0
+
+    if commercial_target_encoding is not None and "commercial" in df.columns:
+        X["commercial_rate"] = apply_target_encoding(df["commercial"], commercial_target_encoding)
+    else:
+        X["commercial_rate"] = client_encoding.get("__GLOBAL__", 0.3) if client_encoding else 0.3
+
+    # NOTE: delai_jours is intentionally NOT a model feature.
+    # On Ponceblanc it is almost only populated after acceptance (dossier ouvert),
+    # so delai_known would leak the label (~96% accept when known vs ~0.6% when missing).
 
     if include_cost:
 
@@ -893,7 +1161,7 @@ def build_feature_matrix(
 
         X["prix_total"] = price
 
-    # Only Ponceblanc uses this.
+    # Only Ponceblanc uses this (legacy path).
     if include_taux_marge:
 
         X["taux_marge"] = pd.to_numeric(
