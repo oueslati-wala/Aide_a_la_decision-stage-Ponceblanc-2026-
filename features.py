@@ -1083,18 +1083,32 @@ def build_feature_matrix(
     X["client_encoded"] = apply_client_encoding(df["client"], client_encoding)
 
     # Season: 4-month blocks (1=Jan–Apr, 2=May–Aug, 3=Sep–Dec)
+    # Missing month (UI toggle off) → NaN on all calendar features so the model
+    # does not silently use mid-year / S2.
     month = (
         pd.to_numeric(df["month"], errors="coerce")
         if "month" in df.columns
         else pd.Series(np.nan, index=df.index)
     )
-    month_filled = month.fillna(6.0).clip(1, 12)
-    X["month"] = month_filled.astype(float)
-    X["month_sin"] = np.sin(2 * np.pi * month_filled / 12.0)
-    X["month_cos"] = np.cos(2 * np.pi * month_filled / 12.0)
-    X["month_known"] = month.notna().astype(float)
-    # 4-month season code
-    X["season_4m"] = ((month_filled - 1) // 4 + 1).astype(float).clip(1, 3)
+    known = month.notna()
+    month_num = month.clip(1, 12)
+    X["month"] = month_num.astype(float)  # stays NaN when unknown
+    X["month_sin"] = pd.Series(
+        np.where(known, np.sin(2 * np.pi * month_num / 12.0), np.nan),
+        index=df.index,
+        dtype=float,
+    )
+    X["month_cos"] = pd.Series(
+        np.where(known, np.cos(2 * np.pi * month_num / 12.0), np.nan),
+        index=df.index,
+        dtype=float,
+    )
+    X["month_known"] = known.astype(float)
+    X["season_4m"] = pd.Series(
+        np.where(known, ((month_num - 1) // 4 + 1).clip(1, 3), np.nan),
+        index=df.index,
+        dtype=float,
+    )
 
     if include_cost:
         cost = pd.to_numeric(df["cout_total"], errors="coerce")

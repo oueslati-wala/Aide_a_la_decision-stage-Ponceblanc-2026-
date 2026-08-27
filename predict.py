@@ -112,9 +112,12 @@ class QuoteEstimator:
             "format_encoding": _load_json("format_encoding.json"),
             "commercial_encoding": _load_json("commercial_encoding.json"),
             "commercial_target_encoding": _load_json("commercial_target_encoding.json"),
+            "coeff_priors": _load_json("coeff_priors.json") or {},
             "regressor_target": metadata.get("target"),
             "regressor_mode": metadata.get("mode"),
             "target_transform": metadata.get("target_transform", "identity"),
+            "coeff_clip": metadata.get("coeff_clip") or [0.80, 4.00],
+            "small_n_blend": float(metadata.get("small_n_blend") or 0.0),
             "metrics": metrics,
         }
 
@@ -381,13 +384,48 @@ class QuoteEstimator:
             log_cost=True,
             **self._feature_kwargs(bundle),
         )
+        # Hierarchical coefficient priors (client / product medians)
+        priors = bundle.get("coeff_priors") or {}
+        if priors:
+            global_med = float(priors.get("global", 1.3))
+            by_c = priors.get("by_client") or {}
+            by_p = priors.get("by_produit") or {}
+            c_key = str(client).strip().upper()
+            p_key = str(features.normalize_produit(str(produit).strip())).upper()
+            c_prior = float(by_c.get(c_key, global_med))
+            p_prior = float(by_p.get(p_key, global_med))
+            X = X.copy()
+            X["client_coeff_prior"] = c_prior
+            X["produit_coeff_prior"] = p_prior
+            X["hier_coeff_prior"] = (c_prior + p_prior) / 2.0
         X = X.reindex(
             columns=bundle["regressor_features"],
             fill_value=np.nan,
         )
-        c_lo = float(np.clip(bundle["reg_lower"].predict(X)[0], 0.80, 4.00))
-        c_med = float(np.clip(bundle["reg_best"].predict(X)[0], 0.80, 4.00))
-        c_hi = float(np.clip(bundle["reg_upper"].predict(X)[0], 0.80, 4.00))
+        lo_c, hi_c = bundle.get("coeff_clip") or [0.80, 4.00]
+        lo_c, hi_c = float(lo_c), float(hi_c)
+        transform = bundle.get("target_transform", "identity")
+        blend = float(bundle.get("small_n_blend") or 0.0)
+
+        def _decode(raw: float) -> float:
+            val = float(np.exp(raw)) if transform == "log" else float(raw)
+            return float(np.clip(val, lo_c, hi_c))
+
+        c_lo_m = _decode(bundle["reg_lower"].predict(X)[0])
+        c_med_m = _decode(bundle["reg_best"].predict(X)[0])
+        c_hi_m = _decode(bundle["reg_upper"].predict(X)[0])
+        if blend > 0 and "hier_coeff_prior" in X.columns:
+            hier = float(X["hier_coeff_prior"].iloc[0])
+            c_lo = float(np.clip(blend * hier + (1 - blend) * c_lo_m, lo_c, hi_c))
+            c_med = float(np.clip(blend * hier + (1 - blend) * c_med_m, lo_c, hi_c))
+            c_hi = float(np.clip(blend * hier + (1 - blend) * c_hi_m, lo_c, hi_c))
+            # Keep quantile spread sensible around the blended median
+            if c_lo > c_med:
+                c_lo = c_med * 0.92
+            if c_hi < c_med:
+                c_hi = c_med * 1.08
+        else:
+            c_lo, c_med, c_hi = c_lo_m, c_med_m, c_hi_m
         base_lower = max(cost, c_lo * cost)
         base_median = max(cost, c_med * cost)
         base_upper = max(cost, c_hi * cost)

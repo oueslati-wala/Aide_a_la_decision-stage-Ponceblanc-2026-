@@ -5,8 +5,8 @@
   "n_test": 1227,
   "acceptance_rate": 0.3094111890393084,
   "classifier": {
-    "accuracy": 0.7457212713936431,
-    "roc_auc": 0.7714332318399304,
+    "accuracy": 0.7408312958435208,
+    "roc_auc": 0.7694820729509724,
     "features": [
       "quantite",
       "produit_cluster",
@@ -23,10 +23,12 @@
   "margin_regressor": {
     "target": "coefficient",
     "mode": "coeff_times_cost",
-    "target_transform": "identity",
-    "mae": 208.379123489508,
-    "mae_coeff": 0.08747970439372468,
-    "n_rows": 1857,
+    "target_transform": "log",
+    "mae": 207.80201917527594,
+    "mae_coeff": 0.07063752126461575,
+    "mae_baseline_eur": 285.5211496157202,
+    "within_20pct": 0.9669669669669669,
+    "n_rows": 1665,
     "features": [
       "quantite",
       "produit_cluster",
@@ -36,23 +38,31 @@
       "month_cos",
       "month_known",
       "season_4m",
-      "cout_total"
+      "cout_total",
+      "client_coeff_prior",
+      "produit_coeff_prior",
+      "hier_coeff_prior"
     ],
+    "coeff_clip": [
+      0.9,
+      1.3572056036110036
+    ],
+    "small_n_blend": 0.0,
     "coeff_training": {
-      "min": 0.8049943461097364,
-      "p10": 0.9600245581436423,
-      "median": 1.1667738109645407,
-      "p90": 1.3000000000000005,
-      "max": 2.7215979999999997
+      "min": 0.9011442592756379,
+      "p10": 1.0,
+      "median": 1.1669859116689985,
+      "p90": 1.2999999999999998,
+      "max": 1.3564972783358882
     },
     "cost_training_range_eur": {
       "min": 39.69307540854701,
-      "median": 860.6254444444444,
+      "median": 925.5557555133335,
       "max": 143684.4078935348
     }
   },
   "regressor_target": "coefficient",
   "regressor_mode": "coeff_times_cost",
-  "target_transform": "identity",
+  "target_transform": "log",
   "extra_encodings": []
 }

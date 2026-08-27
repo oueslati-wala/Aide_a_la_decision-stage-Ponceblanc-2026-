@@ -117,11 +117,13 @@ def train_classifier(
         X_train = X_train.drop(columns=all_nan)
         X_test = X_test.drop(columns=all_nan)
 
+    n_train = len(train_df)
     classifier = HistGradientBoostingClassifier(
-        max_depth=6,
-        learning_rate=0.08,
-        max_iter=200,
-        min_samples_leaf=20,
+        max_depth=5 if n_train < 2000 else 6,
+        learning_rate=0.06 if n_train < 2000 else 0.08,
+        max_iter=250,
+        min_samples_leaf=max(20, n_train // 80),
+        l2_regularization=1.0 if n_train < 2000 else 0.1,
         random_state=RANDOM_STATE,
     )
 
@@ -154,6 +156,41 @@ def train_classifier(
 # PRICE REGRESSOR
 # ---------------------------------------------------------------------
 
+def _fit_coeff_priors(train_df: pd.DataFrame, min_n: int = 4) -> dict:
+    """Median coefficient by client / product (train accepted only)."""
+    global_med = float(train_df["coeff"].median())
+    by_client = {}
+    for client, g in train_df.groupby(train_df["client"].astype(str).str.upper()):
+        if len(g) >= min_n:
+            by_client[str(client)] = float(g["coeff"].median())
+    by_produit = {}
+    for prod, g in train_df.groupby(train_df["produit"].astype(str).str.upper()):
+        if len(g) >= 3:
+            by_produit[str(prod)] = float(g["coeff"].median())
+    return {
+        "global": global_med,
+        "by_client": by_client,
+        "by_produit": by_produit,
+        "min_n_client": min_n,
+        "min_n_produit": 3,
+    }
+
+
+def _apply_coeff_priors(df: pd.DataFrame, priors: dict) -> pd.DataFrame:
+    """Add client_coeff_prior / produit_coeff_prior columns."""
+    global_med = float(priors.get("global", 1.3))
+    by_c = priors.get("by_client") or {}
+    by_p = priors.get("by_produit") or {}
+    clients = df["client"].astype(str).str.upper()
+    prods = df["produit"].astype(str).str.upper()
+    out = pd.DataFrame(index=df.index)
+    out["client_coeff_prior"] = clients.map(lambda c: by_c.get(c, global_med)).astype(float)
+    out["produit_coeff_prior"] = prods.map(lambda p: by_p.get(p, global_med)).astype(float)
+    # Hierarchical: prefer client× implicitly via average of both priors
+    out["hier_coeff_prior"] = (out["client_coeff_prior"] + out["produit_coeff_prior"]) / 2.0
+    return out
+
+
 def train_price_regressor(
     df,
     product_clusters,
@@ -176,13 +213,15 @@ def train_price_regressor(
     )
 
     before = len(reg_df)
-    reg_df = reg_df[
-        (reg_df["coeff"] >= 0.80)
-        & (reg_df["coeff"] <= 4.00)
-    ].copy()
+    # Adaptive clip: keep the central mass; hard floor/ceiling for sanity
+    lo = max(0.90, float(reg_df["coeff"].quantile(0.05)))
+    hi = min(3.00, float(reg_df["coeff"].quantile(0.95)))
+    if hi <= lo:
+        lo, hi = 0.90, 3.00
+    reg_df = reg_df[(reg_df["coeff"] >= lo) & (reg_df["coeff"] <= hi)].copy()
     print(
         f"  accepted rows for price model: {len(reg_df)} "
-        f"(dropped {before - len(reg_df)} outlier coeffs)"
+        f"(dropped {before - len(reg_df)} outlier coeffs; clip [{lo:.2f}, {hi:.2f}])"
     )
 
     if len(reg_df) < 20:
@@ -195,6 +234,11 @@ def train_price_regressor(
         random_state=RANDOM_STATE,
     )
 
+    # Hierarchical priors fitted on train only (no leakage)
+    priors = _fit_coeff_priors(train_df)
+    with open(output_dir / "coeff_priors.json", "w", encoding="utf-8") as f:
+        json.dump(priors, f, ensure_ascii=False, indent=2)
+
     kwargs = _feature_kwargs(encodings)
 
     X_train = features.build_feature_matrix(
@@ -205,7 +249,6 @@ def train_price_regressor(
         log_cost=True,
         **kwargs,
     )
-
     X_test = features.build_feature_matrix(
         test_df,
         product_clusters,
@@ -214,35 +257,80 @@ def train_price_regressor(
         log_cost=True,
         **kwargs,
     )
+    X_train = pd.concat([X_train, _apply_coeff_priors(train_df, priors)], axis=1)
+    X_test = pd.concat([X_test, _apply_coeff_priors(test_df, priors)], axis=1)
 
-    y_train = train_df["coeff"].astype(float)
+    # Log-target stabilizes heavy tails; inverse = exp at predict time
+    y_train_log = np.log(train_df["coeff"].astype(float).clip(lower=1e-3))
     y_test_coeff = test_df["coeff"].astype(float)
     y_test_price = test_df["prix_total"].astype(float)
     cost_test = test_df["cout_total"].astype(float)
 
-    params = dict(
-        max_depth=5,
-        learning_rate=0.08,
-        max_iter=250,
-        min_samples_leaf=15,
-        random_state=RANDOM_STATE,
-    )
+    small_n = len(train_df) < 400
+    if small_n:
+        # Strong regularization — avoid overfitting sparse accepted quotes
+        params = dict(
+            max_depth=3,
+            learning_rate=0.05,
+            max_iter=150,
+            min_samples_leaf=max(15, len(train_df) // 15),
+            l2_regularization=1.0,
+            random_state=RANDOM_STATE,
+        )
+        print(f"  small-n mode (n_train={len(train_df)}): depth=3, strong L2")
+    else:
+        params = dict(
+            max_depth=5,
+            learning_rate=0.08,
+            max_iter=250,
+            min_samples_leaf=15,
+            l2_regularization=0.1,
+            random_state=RANDOM_STATE,
+        )
 
     best = HistGradientBoostingRegressor(loss="squared_error", **params)
-    lower = HistGradientBoostingRegressor(loss="quantile", quantile=0.10, **params)
-    upper = HistGradientBoostingRegressor(loss="quantile", quantile=0.90, **params)
+    lower = HistGradientBoostingRegressor(loss="quantile", quantile=0.15, **params)
+    upper = HistGradientBoostingRegressor(loss="quantile", quantile=0.85, **params)
 
-    best.fit(X_train, y_train)
-    lower.fit(X_train, y_train)
-    upper.fit(X_train, y_train)
+    best.fit(X_train, y_train_log)
+    lower.fit(X_train, y_train_log)
+    upper.fit(X_train, y_train_log)
 
-    pred_coeff = np.clip(best.predict(X_test), 0.80, 4.00)
+    def _to_coeff(log_pred):
+        return np.clip(np.exp(log_pred), lo, hi)
+
+    pred_model = _to_coeff(best.predict(X_test))
+    pred_hier = X_test["hier_coeff_prior"].to_numpy()
+    baseline_eur = float(priors["global"]) * cost_test.values
+    mae_glob = float(mean_absolute_error(y_test_price, baseline_eur))
+
+    # Small-n: lean hard on client/product median coefficients.
+    # A free GBM overfits ~200 accepted quotes and loses to a flat median.
+    blend = 0.0
+    if small_n:
+        blend = 0.85
+        pred_coeff = np.clip(blend * pred_hier + (1.0 - blend) * pred_model, lo, hi)
+        mae_blend = float(mean_absolute_error(y_test_price, pred_coeff * cost_test.values))
+        if mae_blend > mae_glob * 1.01:
+            blend = 1.0
+            pred_coeff = np.clip(pred_hier, lo, hi)
+            print(f"  pure hierarchical priors (model residual hurt hold-out MAE)")
+        else:
+            print(f"  blend hierarchical {blend:.0%} + model {1-blend:.0%}")
+    else:
+        pred_coeff = pred_model
+
     pred_eur = pred_coeff * cost_test.values
 
     mae = float(mean_absolute_error(y_test_price, pred_eur))
     mae_coeff = float(mean_absolute_error(y_test_coeff, pred_coeff))
+    mae_baseline = mae_glob
+    within_20 = float(
+        (np.abs(y_test_price.values - pred_eur) / np.maximum(y_test_price.values, 1e-6) <= 0.20).mean()
+    )
 
-    print(f"  price MAE = {mae:,.2f} €  |  coeff MAE = {mae_coeff:.3f}")
+    print(f"  price MAE = {mae:,.2f} €  |  coeff MAE = {mae_coeff:.3f}  |  within±20% = {within_20:.0%}")
+    print(f"  baseline (global median coeff) MAE = {mae_baseline:,.2f} €")
     print(
         f"  coeff train median = {float(train_df['coeff'].median()):.2f}  "
         f"p10={float(train_df['coeff'].quantile(0.10)):.2f}  "
@@ -256,14 +344,29 @@ def train_price_regressor(
     with open(output_dir / "margin_feature_columns.json", "w", encoding="utf-8") as f:
         json.dump(list(X_train.columns), f)
 
+    meta = {
+        "target": "coefficient",
+        "mode": "coeff_times_cost",
+        "target_transform": "log",
+        "coeff_clip": [lo, hi],
+        "small_n_blend": blend,
+        "uses_coeff_priors": True,
+    }
+    with open(output_dir / "regressor_target.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
     return {
         "target": "coefficient",
         "mode": "coeff_times_cost",
-        "target_transform": "identity",
+        "target_transform": "log",
         "mae": mae,
         "mae_coeff": mae_coeff,
+        "mae_baseline_eur": mae_baseline,
+        "within_20pct": within_20,
         "n_rows": int(len(reg_df)),
         "features": list(X_train.columns),
+        "coeff_clip": [lo, hi],
+        "small_n_blend": blend,
         "coeff_training": {
             "min": float(reg_df["coeff"].min()),
             "p10": float(reg_df["coeff"].quantile(0.10)),
@@ -341,9 +444,9 @@ def train_source(source):
         output_dir,
     )
 
-    target = "coefficient"
-    mode = "coeff_times_cost"
-    transform = "identity"
+    target = (reg_metrics or {}).get("target", "coefficient")
+    mode = (reg_metrics or {}).get("mode", "coeff_times_cost")
+    transform = (reg_metrics or {}).get("target_transform", "log")
 
     metrics = {
         "source": source,
@@ -363,12 +466,14 @@ def train_source(source):
         "extra_encodings": list(encodings.keys()),
     }
 
-    with open(output_dir / "regressor_target.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {"target": target, "mode": mode, "target_transform": transform},
-            f,
-            indent=2,
-        )
+    # regressor_target.json already written inside train_price_regressor when successful
+    if reg_metrics is None:
+        with open(output_dir / "regressor_target.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {"target": target, "mode": mode, "target_transform": transform},
+                f,
+                indent=2,
+            )
 
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)

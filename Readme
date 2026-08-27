@@ -96,9 +96,18 @@ Relancer Streamlit après un retrain (ou vider le cache Streamlit).
 
 ## Métriques (ordre de grandeur actuel)
 
-| Source | Devis | Taux accept. | ROC-AUC classif. | MAE coeff (acceptés) |
-|--------|------:|-------------:|-----------------:|---------------------:|
-| Ponceblanc | ~1 950 | ~35 % | ~0.72 | ~0.42 |
-| LBFI | ~6 100 | ~31 % | ~0.77 | ~0.08 |
+| Source | Devis | Taux accept. | ROC-AUC | MAE coeff | Prix ±20 % | Confiance (éval.) |
+|--------|------:|-------------:|--------:|----------:|-----------:|-------------------|
+| Ponceblanc | ~1 950 | ~35 % | ~0.72 | ~0.44 | ~56 % | Faible / moyenne |
+| LBFI | ~6 100 | ~31 % | ~0.77 | ~0.09 | ~94 % | Élevée |
 
-Valeurs exactes dans `models/*/metrics.json` et page **Performance des modèles**.
+Valeurs exactes et **tests de confiance en langage clair** : page **Performance des modèles**
+(bouton « Lancer l'évaluation complète ») ou `python eval_models.py`.
+
+### Ce que mesure la page Performance
+
+- **Classifieur** : AUC vs hasard, précision vs « toujours la majorité », matrice de confusion
+  en français, calibration des probabilités, clients fréquents vs rares.
+- **Régresseur** : erreur € et %, part des prix à ±10 % / ±20 % du réel, comparaison à une
+  règle naïve (coefficient médian), erreur par tranche de coût.
+- **Verdict 0–100** : résumé pour décider si on s'appuie sur le modèle ou sur l'historique seul.

@@ -292,11 +292,13 @@ def cached_recommend(
     produit: str,
     quantite: float,
     cout_total: float,
-    month: int,
-    year: int,
-    _version: int = 16,
+    month: int | None,
+    year: int | None,
+    _version: int = 17,
 ):
-    """Cache price recommendation for identical inputs (fast UI)."""
+    """Cache price recommendation for identical inputs (fast UI).
+    month/year may be None when the user disables date/season.
+    """
     est = get_estimator()
     rec = est.recommend_price(
         client=client,
@@ -417,26 +419,62 @@ def filter_similar(
     quantite: float,
     qty_tol: float = 0.5,
 ) -> pd.DataFrame:
+    """
+    Rank historical quotes by proximity (priority order):
+      1. same client + same product + close quantity
+      2. same client + same product
+      3. same client only
+    """
     if history.empty:
         return history
 
     sub = history.copy()
+    client_key = (client or "").strip().upper()
+    produit_key = (produit or "").strip().upper()
+    qty = float(quantite) if quantite is not None else 0.0
 
-    if client and client.strip():
-        sub = sub[
-            sub["client"].astype(str).str.contains(client.strip().upper(), na=False)
-        ]
+    if not client_key:
+        return sub.iloc[0:0].copy()
 
-    if produit and produit.strip():
-        sub = sub[
-            sub["produit"].astype(str).str.contains(produit.strip().upper(), na=False)
-        ]
-
-    if len(sub) == 0:
+    client_s = sub["client"].astype(str).str.upper()
+    mask_client_exact = client_s == client_key
+    mask_client = mask_client_exact if mask_client_exact.any() else client_s.str.contains(client_key, na=False)
+    sub = sub.loc[mask_client].copy()
+    if sub.empty:
         return sub
 
-    sub = sub.assign(_qty_dist=(sub["quantite"] - quantite).abs())
-    return sub.sort_values("_qty_dist")
+    prod_s = sub["produit"].astype(str).str.upper()
+    if produit_key:
+        mask_prod = prod_s == produit_key
+        if not mask_prod.any():
+            mask_prod = prod_s.str.contains(produit_key, na=False)
+    else:
+        mask_prod = pd.Series(False, index=sub.index)
+
+    qty_s = pd.to_numeric(sub["quantite"], errors="coerce")
+    qty_dist = (qty_s - qty).abs()
+    if qty > 0 and qty_tol is not None:
+        lo, hi = qty * (1.0 - float(qty_tol)), qty * (1.0 + float(qty_tol))
+        mask_qty = qty_s.between(lo, hi)
+    else:
+        mask_qty = pd.Series(False, index=sub.index)
+
+    priority = pd.Series(3, index=sub.index, dtype=int)  # 3 = client only
+    priority.loc[mask_prod] = 2                          # 2 = client + product
+    priority.loc[mask_prod & mask_qty] = 1                # 1 = client + product + qty
+
+    labels = {
+        1: "1 · Client + produit + qté",
+        2: "2 · Client + produit",
+        3: "3 · Même client",
+    }
+    sub = sub.assign(
+        _priority=priority.to_numpy(),
+        _qty_dist=qty_dist.fillna(1e18).to_numpy(),
+        Proximité=priority.map(labels).to_numpy(),
+    )
+    return sub.sort_values(["_priority", "_qty_dist"], ascending=[True, True])
+
 
 
 def source_stats(df: pd.DataFrame, source: str) -> dict:
@@ -625,8 +663,8 @@ if page == "Aide à la décision":
         )
 
     with col_c:
-        
-        # --- Date ↔ saison (4 mois) keep in sync ---
+
+        # --- Date / saison optionnelle ---
         season_labels = {
             1: "S1 — Janvier à Avril",
             2: "S2 — Mai à Août",
@@ -635,17 +673,29 @@ if page == "Aide à la décision":
         season_mid_month = {1: 2, 2: 6, 3: 10}  # representative month for the model
         date_key = f"date_{source}"
         season_key = f"season4m_{source}"
+        use_season_key = f"use_season_{source}"
 
         def _season_from_month(m: int) -> int:
             return min(3, max(1, (int(m) - 1) // 4 + 1))
 
-        # Init session defaults once
         if date_key not in st.session_state:
             st.session_state[date_key] = __import__("datetime").date.today()
         if season_key not in st.session_state:
-            st.session_state[season_key] = _season_from_month(st.session_state[date_key].month)
+            st.session_state[season_key] = _season_from_month(
+                st.session_state[date_key].month
+            )
+        if use_season_key not in st.session_state:
+            st.session_state[use_season_key] = True
 
-        # Detect which control the user last changed via dedicated flags
+        use_season = st.toggle(
+            "Prendre en compte la date / saison",
+            key=use_season_key,
+            help=(
+                "Désactivez pour ignorer le calendrier dans l'estimation. "
+                "Date et saison deviennent grisées et ne sont plus envoyées au modèle."
+            ),
+        )
+
         def _on_date_change():
             d = st.session_state.get(date_key)
             if d is not None:
@@ -655,7 +705,6 @@ if page == "Aide à la décision":
             s = int(st.session_state.get(season_key, 1))
             d = st.session_state.get(date_key)
             if d is not None:
-                # keep year, move day to mid-month of selected season
                 mid = season_mid_month[s]
                 import datetime as _dt
                 day = min(d.day, 28)
@@ -665,6 +714,7 @@ if page == "Aide à la décision":
             "Date du devis",
             key=date_key,
             on_change=_on_date_change,
+            disabled=not use_season,
             help="Change la saison automatiquement (S1/S2/S3).",
         )
         season_4m = st.selectbox(
@@ -673,23 +723,35 @@ if page == "Aide à la décision":
             format_func=lambda s: season_labels[s],
             key=season_key,
             on_change=_on_season_change,
+            disabled=not use_season,
             help="Change la date vers le milieu de la saison (même année).",
         )
-        month = season_mid_month[int(season_4m)]
-        year = int(date_devis.year) if date_devis else 2024
 
-        # No manual heuristics — season comes only from month/trimester above
+        if use_season:
+            month = season_mid_month[int(season_4m)]
+            year = int(date_devis.year) if date_devis else 2024
+        else:
+            # Explicitly unknown → feature matrix sets month_known=0
+            month = None
+            year = None
+
         saison = None
         pression_concurrentielle = None
         marge_cible = None
         delai_livraison = None
-
         prix_candidat = None
 
-    st.caption(
-        "Entrées modèle : client, type de produit, matière, quantité, "
-        "coûts (achat + fabrication + transport), date → mois/trimestre (saison)."
-    )
+    if use_season:
+        st.caption(
+            "Entrées modèle : client, type de produit, quantité, "
+            "coûts (achat + fabrication + transport), date → saison 4 mois."
+        )
+    else:
+        st.caption(
+            "Entrées modèle : client, type de produit, quantité, "
+            "coûts (achat + fabrication + transport). "
+            "**Date / saison ignorées** pour cette estimation."
+        )
 
     with st.expander("Filtres pour l'historique comparable (n'entraînent pas le modèle)"):
         f1, f2, f3 = st.columns(3)
@@ -710,12 +772,7 @@ if page == "Aide à la décision":
                 value=10,
             )
 
-    similar = filter_similar(history, client, produit, quantite)
-
-    if not similar.empty and qty_band < 1.0:
-        lo_q = quantite * (1 - qty_band)
-        hi_q = quantite * (1 + qty_band)
-        similar = similar[(similar["quantite"] >= lo_q) & (similar["quantite"] <= hi_q)]
+    similar = filter_similar(history, client, produit, quantite, qty_tol=float(qty_band))
 
     if only_accepted and not similar.empty:
         similar = similar[similar["signe"] == 1]
@@ -741,8 +798,8 @@ if page == "Aide à la décision":
             produit=produit,
             quantite=float(quantite),
             cout_total=float(cout_total),
-            month=int(month),
-            year=int(year),
+            month=int(month) if month is not None else None,
+            year=int(year) if year is not None else None,
         )
         prix_recommande = float(rec["prix_median"])
 
@@ -752,15 +809,26 @@ if page == "Aide à la décision":
 
         with st.container(border=True):
             m1, m2, m3, m4 = st.columns(4)
+            marge_reco = compute_margin(prix_recommande, cout_total)
             m1.metric("Prix recommandé (total)", fmt_eur(prix_recommande))
             m2.metric(
                 "Prix unitaire (reco)",
                 f"{prix_unitaire_reco:,.4f} €".replace(",", " "),
                 help="Prix total recommandé ÷ quantité",
             )
-            m3.metric("Coût total", fmt_eur(cout_total))
-            marge_reco = compute_margin(prix_recommande, cout_total)
+            m3.metric(
+                "Coefficient de marge",
+                fmt_coefficient(marge_reco["coefficient"]),
+                help="prix / coût (ex. 1.30 = +30 % sur le coût)",
+            )
             m4.metric("P(acceptation)", f"{proba_reco:.0%}", help=interpret_proba(proba_reco))
+            m5, m6 = st.columns(2)
+            m5.metric("Coût total", fmt_eur(cout_total))
+            m6.metric(
+                "Marge (€)",
+                fmt_eur(marge_reco["marge_eur"]),
+                delta=fmt_pct_signed(marge_reco["taux_pct"]),
+            )
 
             st.success(
                 f"{probability_label(proba_reco)} — Prix recommandé : "
@@ -800,9 +868,15 @@ if page == "Aide à la décision":
                 bullets.append(f"- **Type produit {produit_key}** : rare → profil plus volatil.")
         bullets.append(f"- **Quantité** : {quantite}")
         bullets.append(f"- **Coût total** : {fmt_eur(cout_total)} (achat + fab + transport)")
-        season_code = int((month - 1) // 4) + 1
-        season_names = {1: "S1 Jan–Avr", 2: "S2 Mai–Août", 3: "S3 Sep–Déc"}
-        bullets.append(f"- **Saison** : {season_names.get(season_code, season_code)} (année {year})")
+        if month is not None:
+            season_code = int((month - 1) // 4) + 1
+            season_names = {1: "S1 Jan–Avr", 2: "S2 Mai–Août", 3: "S3 Sep–Déc"}
+            bullets.append(
+                f"- **Saison** : {season_names.get(season_code, season_code)}"
+                + (f" (année {year})" if year is not None else "")
+            )
+        else:
+            bullets.append("- **Saison** : *non prise en compte* (bascule désactivée)")
         st.markdown("\n".join(bullets))
 
     with col_b:
@@ -810,12 +884,17 @@ if page == "Aide à la décision":
         auc = (metrics or {}).get("classifier", {}).get("roc_auc")
         auc_txt = f"{auc:.3f}" if auc is not None else "n/a"
         st.markdown("**Lecture**")
+        season_line = (
+            "client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S3)."
+            if month is not None
+            else "client, type de produit, quantité, coût total (**sans** date/saison)."
+        )
         st.markdown(
             f"""
 Modèle **{label}** (ROC-AUC test ≈ **{auc_txt}**).
 
 Entrées **uniquement** :
-client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S3).
+{season_line}
 
 **Non utilisés** : matière, délai offre→décision, format, commercial, heuristiques.
 
@@ -853,39 +932,39 @@ client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S
     # Scenarios
     # --- Saisie prix de vente unitaire (→ total = unitaire × quantité) ---
     st.subheader("4. Votre prix de vente unitaire")
-    pu_key = f"prix_unitaire_saisie_{source}"
-    default_pu = float(prix_recommande / quantite) if quantite and quantite > 0 else 0.0
-    if pu_key not in st.session_state:
-        st.session_state[pu_key] = round(default_pu, 4)
-
-    # When recommended price / qty change a lot, refresh default if user hasn't locked
+    choice_key = f"votre_choix_prix_{source}"
+    pu_widget_key = f"pu_input_{source}"
     cost_sync_key = f"pu_sync_cost_{source}"
+    qty_f = float(quantite) if quantite else 1.0
+    default_pu = float(prix_recommande / qty_f) if qty_f > 0 else 0.0
+
+    # Reset unit price when cost profile changes
     if (
         cost_sync_key not in st.session_state
         or abs(float(st.session_state.get(cost_sync_key, 0)) - float(cout_total)) > 1.0
     ):
-        st.session_state[pu_key] = round(default_pu, 4)
         st.session_state[cost_sync_key] = float(cout_total)
+        st.session_state[pu_widget_key] = round(default_pu, 4)
+
+    if pu_widget_key not in st.session_state:
+        st.session_state[pu_widget_key] = round(default_pu, 4)
 
     col_pu, col_pt = st.columns(2)
     with col_pu:
         prix_unitaire_saisi = st.number_input(
             "Prix de vente unitaire (€ / exemplaire)",
             min_value=0.0,
-            value=float(st.session_state[pu_key]),
             step=0.01,
             format="%.4f",
-            key=f"pu_input_{source}",
-            help="Saisissez le prix de vente par exemplaire. Le total = unitaire × quantité.",
+            key=pu_widget_key,
+            help="Prix de vente par exemplaire. Le total = unitaire × quantité.",
         )
-        st.session_state[pu_key] = float(prix_unitaire_saisi)
+    prix_total_from_unit = float(prix_unitaire_saisi) * qty_f
     with col_pt:
-        prix_total_from_unit = float(prix_unitaire_saisi) * float(quantite)
         st.metric("Prix de vente total correspondant", fmt_eur(prix_total_from_unit))
-        st.caption(f"= {prix_unitaire_saisi:.4f} € × {int(quantite)} exemplaires")
+        st.caption(f"= {float(prix_unitaire_saisi):.4f} € × {int(qty_f)} exemplaires")
 
-    # Drive "Votre choix" from unit price
-    choice_key = f"votre_choix_prix_{source}"
+    # Always keep choice_key defined for the rest of the page
     st.session_state[choice_key] = float(prix_total_from_unit)
 
     st.subheader("5. Scénarios de décision")
@@ -1024,11 +1103,10 @@ client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S
         ] = float(max_acc["prix"])
 
     # "Votre choix" follows the unit selling price input above
-    choice_key = f"votre_choix_prix_{source}"
     st.session_state[choice_key] = float(prix_total_from_unit)
 
     # Batch scenario probabilities (one classifier call)
-    scenario_items = list(anchor_prices.items()) + [("Votre choix (via PU)", st.session_state[choice_key])]
+    scenario_items = list(anchor_prices.items()) + [("Votre choix (via PU)", float(st.session_state[choice_key]))]
     scen_prices = np.array([float(v) for _, v in scenario_items], dtype=float)
     try:
         scen_rows = [
@@ -1116,11 +1194,12 @@ client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S
         ].iloc[0]
     )
     new_choice_price = max(MIN_PRICE, min(float(MAX_PRICE), new_choice_price))
-    if abs(new_choice_price - float(st.session_state[choice_key])) > 0.01:
+    prev_choice = float(st.session_state.get(choice_key, prix_total_from_unit))
+    if abs(new_choice_price - prev_choice) > 0.01:
         st.session_state[choice_key] = new_choice_price
-        # keep unit price in sync
+        # keep unit price widget in sync
         if quantite and float(quantite) > 0:
-            st.session_state[pu_key] = round(new_choice_price / float(quantite), 4)
+            st.session_state[pu_widget_key] = round(new_choice_price / float(quantite), 4)
         st.rerun()
 
 
@@ -1168,14 +1247,15 @@ client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S
         qty_max = float(similar["quantite"].max()) if "quantite" in similar.columns else None
 
         # Same product type only (exact) vs current filter set
-        exact_prod = similar[similar["produit"].astype(str).str.upper() == str(produit).upper()] if "produit" in similar.columns else similar
-        n_exact = len(exact_prod)
+        n1 = int((similar["_priority"] == 1).sum()) if "_priority" in similar.columns else 0
+        n2 = int((similar["_priority"] == 2).sum()) if "_priority" in similar.columns else 0
+        n3 = int((similar["_priority"] == 3).sum()) if "_priority" in similar.columns else 0
 
-        # Two rows so values (esp. qty range) are not truncated
-        r1 = st.columns(3)
-        r1[0].metric("Similaires", f"{n_sim}")
-        r1[1].metric("Même produit", f"{n_exact}")
-        r1[2].metric("Clients distincts", f"{n_clients}")
+        r1 = st.columns(4)
+        r1[0].metric("Total", f"{n_sim}")
+        r1[1].metric("Client+prod+qté", f"{n1}")
+        r1[2].metric("Client+produit", f"{n2}")
+        r1[3].metric("Client seul", f"{n3}")
 
         r2 = st.columns(3)
         r2[0].metric("Acceptés", f"{n_acc}")
@@ -1189,13 +1269,12 @@ client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S
             r2[2].metric("Quantité", "—")
 
         st.caption(
-            f"Tableau : jusqu'à **20** lignes sur **{n_sim}** devis similaires "
-            f"(client ≈ « {client} », produit ≈ « {produit} », "
-            f"quantité ±{qty_band:.0%}). "
-            f"Types produit distincts dans ce filtre : **{n_produits}**."
+            f"Tri par priorité : **1** client+produit+qté (±{qty_band:.0%}) → "
+            f"**2** client+produit → **3** même client. "
+            f"Affiche jusqu'à **20** / **{n_sim}** devis."
         )
 
-        cols = [c for c in ["devis_code", "client", "produit", "quantite", "cout_total", "prix_total", "prix_unitaire", "signe"] if c in similar.columns]
+        cols = [c for c in [ "devis_code", "client", "produit", "quantite", "cout_total", "prix_total", "prix_unitaire", "signe"] if c in similar.columns]
         disp = similar[cols].head(20).copy()
         if "cout_total" in disp:
             disp["cout_total"] = disp["cout_total"].map(fmt_eur)
@@ -1227,56 +1306,123 @@ client, type de produit, quantité, coût total, date → saison 4 mois (S1/S2/S
 elif page == "Performance des modèles":
 
     st.title("Performance des modèles")
-    st.caption(
-        "Évaluation alignée sur `eval_models.py` : split test 20 %, "
-        "mêmes features finales (client, produit, quantité, coût, saison 4 mois)."
+    st.markdown(
+        """
+        Cette page répond à une question simple : **peut-on faire confiance aux modèles ?**
+
+        Les chiffres sont calculés sur des devis **que le modèle n'a jamais vus** pendant
+        l'entraînement (20 % réservés pour le test). C'est la meilleure façon de mesurer
+        s'il généralise, ou s'il a seulement « appris par cœur » l'historique.
+        """
     )
+
+    with st.expander("Comment lire cette page (sans jargon)", expanded=True):
+        st.markdown(
+            """
+**Deux jobs distincts**
+
+1. **Classifieur** — « Pour ce prix, quelle chance d'être accepté ? »  
+   On regarde surtout le **ROC-AUC** (0,5 = hasard, 1,0 = parfait) et si les
+   probabilités annoncées collent à la réalité (calibration).
+
+2. **Régresseur de prix** — « Quel prix de vente typique pour un devis accepté ? »  
+   On regarde l'erreur en **euros** et en **%**, et si le modèle bat une règle naïve
+   (toujours le coefficient médian historique).
+
+**Verdict de confiance**  
+Un score 0–100 résume classifieur + régresseur + volume de données.
+Il n'est pas magique : c'est un guide pour décider si l'outil est une aide fiable
+ou seulement un explorateur d'historique.
+            """
+        )
 
     if "live_eval_results" not in st.session_state:
         st.session_state.live_eval_results = {}
 
-    run_live = st.checkbox(
-        "Recalculer sur le jeu de test (eval_models) — plus lent",
-        value=False,
-        help="Lance l'évaluation et **conserve** les résultats à l'écran jusqu'au prochain recalcul.",
-    )
-    c_run, c_clear = st.columns([1, 1])
+    col_btn, col_info = st.columns([1, 2])
+    with col_btn:
+        do_eval = st.button(
+            "Lancer l'évaluation complète",
+            type="primary",
+            help="Recalcule toutes les métriques + tests de confiance sur le jeu de test.",
+        )
+    with col_info:
+        if st.session_state.live_eval_results:
+            st.success("Résultats d'évaluation chargés (session). Relancer pour rafraîchir.")
+        else:
+            st.info(
+                "Sans évaluation live, seuls les chiffres d'entraînement (metrics.json) "
+                "sont affichés — moins complets. Cliquez le bouton pour les tests détaillés."
+            )
 
-    if run_live:
+    if do_eval:
         try:
             import eval_models
             for src in ("ponceblanc", "lbfi"):
                 with st.spinner(f"Évaluation {src}…"):
-                    st.session_state.live_eval_results[src] = eval_models.evaluate_source(src)
-            st.success("Évaluation terminée — résultats conservés sur cet écran.")
-            # Uncheck is not possible programmatically for checkbox easily; user can leave it
+                    st.session_state.live_eval_results[src] = eval_models.evaluate_source(
+                        src, verbose=False
+                    )
+            st.success("Évaluation terminée.")
+            st.rerun()
         except Exception as exc:
-            st.error(f"Évaluation live impossible : {exc}")
+            st.error(f"Évaluation impossible : {exc}")
 
-    if st.session_state.live_eval_results:
-        st.caption("Affichage des **derniers résultats live** sauvegardés en session.")
-    else:
-        st.caption("Affichage depuis **metrics.json** (entraînement). Cochez la case pour recalculer.")
+    # ---- Summary cards for both sources ----
+    live_any = bool(st.session_state.live_eval_results)
+    summary_rows = []
+    for src in ("ponceblanc", "lbfi"):
+        live = st.session_state.live_eval_results.get(src)
+        metrics = get_metrics(src)
+        if live is None and not metrics:
+            continue
+        if live is not None:
+            trust = live.get("trust") or {}
+            auc = (live.get("classifier") or {}).get("roc_auc")
+            mae_c = (live.get("regressor") or {}).get("mae_coeff")
+            within20 = (live.get("regressor") or {}).get("within_20pct")
+            n_total = live.get("n_total")
+        else:
+            trust = {}
+            auc = (metrics.get("classifier") or {}).get("roc_auc")
+            mae_c = (metrics.get("margin_regressor") or {}).get("mae_coeff")
+            within20 = None
+            n_total = metrics.get("n_total")
+        summary_rows.append({
+            "Source": "Ponceblanc" if src == "ponceblanc" else "LBFI",
+            "Devis": f"{n_total:,}" if n_total else "—",
+            "ROC-AUC": f"{auc:.3f}" if auc is not None else "—",
+            "MAE coeff.": f"{mae_c:.3f}" if mae_c is not None else "—",
+            "Prix ±20 %": f"{within20:.0%}" if within20 is not None else "—",
+            "Confiance": trust.get("label", "— (lancer l'éval.)"),
+            "Score": trust.get("score", "—"),
+        })
+
+    if summary_rows:
+        st.markdown("### Vue d'ensemble")
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, width="stretch")
 
     for src in ("ponceblanc", "lbfi"):
-        title = "PONCEBLANC" if src == "ponceblanc" else "LBFI"
+        title = "Ponceblanc" if src == "ponceblanc" else "LBFI"
+        st.markdown("---")
         st.subheader(title)
 
         live = st.session_state.live_eval_results.get(src)
-
         metrics = get_metrics(src)
         if live is None and not metrics:
-            st.warning(f"metrics.json introuvable pour {src}. Lancez train_models.py.")
+            st.warning(f"Aucune métrique pour {src}. Lancez `python train_models.py`.")
             continue
 
-        # Prefer live eval numbers when available
         if live is not None:
             n_total = live["n_total"]
+            n_test = live.get("n_test")
             acc_rate = live["acceptance_rate"]
             clf = live["classifier"]
             reg = live["regressor"]
+            trust = live.get("trust") or {}
         else:
             n_total = metrics.get("n_total", 0)
+            n_test = metrics.get("n_test")
             acc_rate = metrics.get("acceptance_rate", 0)
             clf = metrics.get("classifier") or {}
             reg_m = metrics.get("margin_regressor") or {}
@@ -1286,69 +1432,245 @@ elif page == "Performance des modèles":
                 "r2_eur": None,
                 "mae_coeff": reg_m.get("mae_coeff"),
                 "r2_coeff": None,
+                "mape": None,
+                "median_ape": None,
+                "within_10pct": None,
+                "within_20pct": None,
+                "baseline_mae_eur": None,
+                "baseline_mape": None,
                 "actual_price_mean": None,
                 "predicted_price_mean": None,
+                "cost_bands": [],
                 "features": reg_m.get("features") or [],
             }
+            trust = {}
 
+        # --- Trust banner ---
+        if trust:
+            color = trust.get("color", "orange")
+            if color == "green":
+                st.success(
+                    f"**{trust.get('label', '')}** — score {trust.get('score', '—')}/100\n\n"
+                    f"{trust.get('advice', '')}"
+                )
+            elif color == "red":
+                st.error(
+                    f"**{trust.get('label', '')}** — score {trust.get('score', '—')}/100\n\n"
+                    f"{trust.get('advice', '')}"
+                )
+            else:
+                st.warning(
+                    f"**{trust.get('label', '')}** — score {trust.get('score', '—')}/100\n\n"
+                    f"{trust.get('advice', '')}"
+                )
+            if trust.get("reasons"):
+                with st.expander("Détail du score de confiance"):
+                    for r in trust["reasons"]:
+                        st.markdown(f"- {r}")
+        else:
+            st.info(
+                "Lancez **l'évaluation complète** pour obtenir le verdict de confiance, "
+                "la calibration des probabilités et les tests par tranche de coût."
+            )
+
+        # --- Volume ---
         with st.container(border=True):
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3 = st.columns(3)
             c1.metric("Devis utilisables", f"{n_total:,}")
-            c2.metric("Taux acceptation", f"{acc_rate:.0%}")
-            c3.metric("Accuracy (test)", f"{clf.get('accuracy', 0):.1%}")
-            auc = clf.get("roc_auc")
-            c4.metric("ROC-AUC (test)", f"{auc:.3f}" if auc is not None else "n/a")
+            c2.metric("Taux d'acceptation historique", f"{acc_rate:.0%}")
+            c3.metric("Devis de test (jamais vus)", f"{n_test:,}" if n_test else "—")
 
-        st.markdown("#### Classifieur — P(acceptation)")
+        # --- Classifier ---
+        st.markdown("#### 1. Probabilité d'acceptation (classifieur)")
+        auc = clf.get("roc_auc")
+        acc = clf.get("accuracy")
+        base_acc = clf.get("baseline_accuracy")
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric(
+            "ROC-AUC",
+            f"{auc:.3f}" if auc is not None else "n/a",
+            help="0,5 = hasard · 0,7 = correct · 0,8+ = bon",
+        )
+        m2.metric(
+            "Précision globale",
+            f"{acc:.0%}" if acc is not None else "n/a",
+        )
+        if base_acc is not None:
+            m3.metric(
+                "Baseline « toujours la majorité »",
+                f"{base_acc:.0%}",
+                help="Si on prédisait toujours la classe la plus fréquente, sans modèle.",
+            )
+
+        if clf.get("interpret_auc"):
+            st.markdown(f"**En clair :** {clf['interpret_auc']}")
+        if clf.get("interpret_accuracy"):
+            st.caption(clf["interpret_accuracy"])
+
+        # Confusion in plain language
+        conf = clf.get("confusion")
+        if conf:
+            st.markdown(
+                f"""
+Sur le jeu de test :
+- **Bien classés acceptés** (vrais positifs) : **{conf.get('tp', 0)}**
+- **Bien classés refusés** (vrais négatifs) : **{conf.get('tn', 0)}**
+- **Faux espoirs** (prédit accepté, en réalité refusé) : **{conf.get('fp', 0)}**
+- **Occasions manquées** (prédit refusé, en réalité accepté) : **{conf.get('fn', 0)}**
+                """
+            )
+
         report = clf.get("report")
         if report:
-            # compact table like classification_report
             rows = []
             for label in ("0", "1"):
                 if label in report:
                     r = report[label]
                     rows.append({
                         "Classe": "Refusé" if label == "0" else "Accepté",
-                        "Precision": f"{r['precision']:.3f}",
-                        "Recall": f"{r['recall']:.3f}",
-                        "F1": f"{r['f1-score']:.3f}"
+                        "Précision": f"{r['precision']:.0%}",
+                        "Rappel": f"{r['recall']:.0%}",
+                        "F1": f"{r['f1-score']:.2f}",
                     })
             if rows:
-                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-        feats = clf.get("features") or []
-        if feats:
-            st.caption("Features classifieur : " + ", ".join(feats))
+                with st.expander("Tableau précision / rappel"):
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+                    st.caption(
+                        "Précision = parmi les « accepté » prédits, combien l'étaient vraiment. "
+                        "Rappel = parmi les vrais acceptés, combien le modèle a trouvés."
+                    )
 
-        st.markdown("#### Régresseur de prix (coefficient × coût)")
+        # Calibration
+        cal = clf.get("calibration") or []
+        if cal:
+            st.markdown("**Calibration des probabilités**")
+            st.caption(
+                "Quand le modèle annonce ~70 %, le taux réel d'acceptation dans cette tranche "
+                "devrait être proche de 70 %. Un écart fort = probabilités mal calibrées."
+            )
+            cal_df = pd.DataFrame(cal)
+            cal_df = cal_df.rename(columns={
+                "tranche_proba": "Tranche annoncée",
+                "n": "Nb devis test",
+                "proba_moyenne": "Proba moyenne",
+                "taux_reel": "Taux réel d'acceptation",
+                "ecart": "Écart (réel − annoncé)",
+            })
+            st.dataframe(cal_df, hide_index=True, width="stretch")
+
+        segs = clf.get("segments") or {}
+        if segs:
+            with st.expander("Clients fréquents vs rares"):
+                for name, s in segs.items():
+                    label = "Clients fréquents (≥ 10 devis)" if "frequent" in name else "Clients rares"
+                    st.markdown(
+                        f"- **{label}** : {s['n']} devis test · "
+                        f"AUC **{s['auc']:.3f}** · précision **{s['accuracy']:.0%}**"
+                    )
+                st.caption(
+                    "Si l'AUC chute fortement sur les clients rares, méfiez-vous des "
+                    "recommandations pour un nouveau client peu présent dans l'historique."
+                )
+
+        # --- Regressor ---
+        st.markdown("#### 2. Prix recommandé (régresseur coefficient × coût)")
         st.write(
-            "Cible : **coefficient** = prix / coût sur devis **acceptés** "
-            "(mode `coeff_times_cost`). Le prix affiché = coefficient × coût."
+            "Le modèle apprend le **coefficient** prix/coût sur les devis **signés**, "
+            "puis affiche `prix = coefficient × coût total`."
         )
+
         r1, r2, r3, r4 = st.columns(4)
-        if reg.get("mae_eur") is not None:
-            r1.metric("MAE prix (€)", fmt_eur(reg["mae_eur"], decimals=0))
-        if reg.get("r2_eur") is not None:
-            r2.metric("R² prix (€)", f"{reg['r2_eur']:.3f}")
         if reg.get("mae_coeff") is not None:
-            r3.metric("MAE coefficient", f"{reg['mae_coeff']:.4f}")
-        if reg.get("r2_coeff") is not None:
-            r4.metric("R² coefficient", f"{reg['r2_coeff']:.3f}")
+            r1.metric("Erreur moyenne sur le coefficient", f"{reg['mae_coeff']:.3f}")
+        if reg.get("median_ape") is not None:
+            r2.metric("Erreur médiane sur le prix", f"{reg['median_ape']:.0%}")
+        if reg.get("within_20pct") is not None:
+            r3.metric("Prix dans ±20 % du réel", f"{reg['within_20pct']:.0%}")
+        if reg.get("within_10pct") is not None:
+            r4.metric("Prix dans ±10 % du réel", f"{reg['within_10pct']:.0%}")
+
+        r5, r6, r7, r8 = st.columns(4)
+        if reg.get("mae_eur") is not None:
+            r5.metric("MAE prix (€)", fmt_eur(reg["mae_eur"], decimals=0))
+        if reg.get("mape") is not None:
+            r6.metric("MAPE (erreur % moyenne)", f"{reg['mape']:.0%}")
+        if reg.get("r2_eur") is not None:
+            r7.metric("R² prix", f"{reg['r2_eur']:.2f}")
+        if reg.get("n_rows") is not None:
+            r8.metric("Devis acceptés avec coût", f"{reg['n_rows']:,}")
+
+        # Baseline comparison
+        if reg.get("baseline_mae_eur") is not None and reg.get("mae_eur") is not None:
+            gain = reg["baseline_mae_eur"] - reg["mae_eur"]
+            if gain > 0:
+                st.success(
+                    f"Le modèle bat la règle naïve « toujours le coefficient médian "
+                    f"({reg.get('baseline_coeff', 0):.2f}) » : "
+                    f"MAE {fmt_eur(reg['mae_eur'], decimals=0)} vs "
+                    f"{fmt_eur(reg['baseline_mae_eur'], decimals=0)} pour la baseline "
+                    f"(gain {fmt_eur(gain, decimals=0)})."
+                )
+            else:
+                st.warning(
+                    f"Le modèle ne bat pas clairement la règle naïve "
+                    f"(coeff médian {reg.get('baseline_coeff', 0):.2f}). "
+                    f"MAE modèle {fmt_eur(reg['mae_eur'], decimals=0)} vs "
+                    f"baseline {fmt_eur(reg['baseline_mae_eur'], decimals=0)}."
+                )
 
         means = []
         if reg.get("actual_price_mean") is not None:
             means.append(f"Prix réel moyen (test) : **{fmt_eur(reg['actual_price_mean'])}**")
         if reg.get("predicted_price_mean") is not None:
             means.append(f"Prix prédit moyen (test) : **{fmt_eur(reg['predicted_price_mean'])}**")
-        if reg.get("n_rows") is not None:
-            means.append(f"Lignes régresseur (acceptés avec coût) : **{reg['n_rows']:,}**")
         if means:
             st.markdown(" · ".join(means))
 
-        reg_feats = reg.get("features") or []
-        if reg_feats:
-            st.caption("Features régresseur : " + ", ".join(reg_feats))
+        bands = reg.get("cost_bands") or []
+        if bands:
+            st.markdown("**Erreur selon la taille du devis (coût)**")
+            bdf = pd.DataFrame(bands).rename(columns={
+                "bande": "Tranche",
+                "cout_min": "Coût min €",
+                "cout_max": "Coût max €",
+                "n": "Nb test",
+                "mae_eur": "MAE €",
+                "mape": "Erreur % moy.",
+            })
+            if "Erreur % moy." in bdf.columns:
+                bdf["Erreur % moy."] = bdf["Erreur % moy."].map(
+                    lambda x: f"{x:.0%}" if pd.notna(x) else "—"
+                )
+            st.dataframe(bdf, hide_index=True, width="stretch")
+            st.caption(
+                "Si l'erreur explose sur les gros devis, soyez plus prudent sur les "
+                "montants élevés — l'historique y est souvent plus rare."
+            )
 
-        st.divider()
+        with st.expander("Features utilisées (technique)"):
+            feats = clf.get("features") or []
+            reg_feats = reg.get("features") or []
+            if feats:
+                st.caption("Classifieur : " + ", ".join(feats))
+            if reg_feats:
+                st.caption("Régresseur : " + ", ".join(reg_feats))
+
+    st.markdown("---")
+    st.markdown(
+        """
+### Comment décider de faire confiance ?
+
+| Situation | Attitude recommandée |
+|-----------|----------------------|
+| Score confiance **élevé**, client/produit **fréquents** | S'appuyer sur le prix recommandé + scénarios |
+| Score **moyen**, ou client peu connu | Utiliser l'outil + **toujours** regarder l'historique comparable |
+| Score **faible**, ou devis hors normes (coeff extrême, coût hors plage) | Explorer l'historique ; le chiffre du modèle n'est qu'indicatif |
+| Probabilités mal calibrées (écarts forts dans le tableau) | Lire P(accept) comme un **ordre de grandeur**, pas un % exact |
+
+L'outil **ne remplace pas** le jugement commercial. Il quantifie les habitudes passées.
+        """
+    )
 
 # ===========================================================================
 # PAGE 3 — Guide
@@ -1375,7 +1697,7 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 | **Produit / type** | Type de produit |
 | **Quantité** | Nombre d'exemplaires |
 | **Coût (€)** | Achat + fabrication + transport → total |
-| **Date** | → saison 4 mois (S1 Jan–Avr / S2 Mai–Août / S3 Sep–Déc) |
+| **Date / saison** | Optionnelle (bascule). Si activée → saison 4 mois (S1/S2/S3) |
 
 ## Ce que le modèle renvoie
 
@@ -1400,7 +1722,7 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 | Type de produit | cluster |
 | Quantité | volume |
 | Coût total | achat + fabrication + transport |
-| Date → saison 4 mois | S1 / S2 / S3 |
+| Date → saison 4 mois | Optionnelle (bascule UI) ; S1 / S2 / S3 si activée |
 | Prix candidat | classifieur uniquement (P(accept)) |
 
 **Non utilisés** : délai offre→décision (ne pilote pas la décision client), format, commercial, heuristiques pression / marge cible.

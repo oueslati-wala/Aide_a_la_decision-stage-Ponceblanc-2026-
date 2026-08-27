@@ -1,1 +1,1 @@
-["quantite", "produit_cluster", "client_encoded", "month", "month_sin", "month_cos", "month_known", "season_4m", "cout_total"]
+["quantite", "produit_cluster", "client_encoded", "month", "month_sin", "month_cos", "month_known", "season_4m", "cout_total", "client_coeff_prior", "produit_coeff_prior", "hier_coeff_prior"]

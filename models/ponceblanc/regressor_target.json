@@ -1,5 +1,11 @@
 {
   "target": "coefficient",
   "mode": "coeff_times_cost",
-  "target_transform": "identity"
+  "target_transform": "log",
+  "coeff_clip": [
+    0.9,
+    3.0
+  ],
+  "small_n_blend": 1.0,
+  "uses_coeff_priors": true
 }
