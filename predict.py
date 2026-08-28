@@ -327,6 +327,7 @@ class QuoteEstimator:
         source: str,
         *,
         cout_total: float | None = None,
+        pricing_mode: str = "balanced",
         saison: str | None = None,
         matiere: str | None = None,
         format_dims: str | None = None,
@@ -337,7 +338,26 @@ class QuoteEstimator:
         month: int | float | None = None,
         year: int | float | None = None,
     ) -> dict:
+        """
+        Recommend a total selling price.
+
+        pricing_mode
+        ------------
+        "balanced" (default) — ambitious but realistic:
+            start from the regressor coeff, then maximise P(accept)×margin
+            only up to ~+12–15 % above that (and never above the source's
+            historical p75 accepted coeff). Middle ground between pure
+            history and full expected-margin aggression.
+        "regressor"
+            prix = predicted coefficient × cost (historical median).
+        "expected_margin"
+            maximises P(accept)×(prix−coût) up to the trained coeff_clip
+            (tends highest).
+        """
         source = source.strip().lower()
+        mode = (pricing_mode or "balanced").strip().lower()
+        if mode not in ("regressor", "expected_margin", "balanced"):
+            mode = "balanced"
         bundle = self._load_source(source)
 
         if cout_total is None or cout_total <= 0:
@@ -355,7 +375,6 @@ class QuoteEstimator:
             fournisseur=fournisseur,
         )
 
-        # Fallback: legacy coefficient-based recommendation.
         row = self._make_row(
             client,
             produit,
@@ -372,7 +391,6 @@ class QuoteEstimator:
             month=month,
             year=year,
         )
-        # Map UI fields onto the columns the trained encodings expect
         if "commercial" not in row.columns:
             row = row.copy()
             row["commercial"] = fournisseur
@@ -384,7 +402,6 @@ class QuoteEstimator:
             log_cost=True,
             **self._feature_kwargs(bundle),
         )
-        # Hierarchical coefficient priors (client / product medians)
         priors = bundle.get("coeff_priors") or {}
         if priors:
             global_med = float(priors.get("global", 1.3))
@@ -419,86 +436,130 @@ class QuoteEstimator:
             c_lo = float(np.clip(blend * hier + (1 - blend) * c_lo_m, lo_c, hi_c))
             c_med = float(np.clip(blend * hier + (1 - blend) * c_med_m, lo_c, hi_c))
             c_hi = float(np.clip(blend * hier + (1 - blend) * c_hi_m, lo_c, hi_c))
-            # Keep quantile spread sensible around the blended median
             if c_lo > c_med:
                 c_lo = c_med * 0.92
             if c_hi < c_med:
                 c_hi = c_med * 1.08
         else:
             c_lo, c_med, c_hi = c_lo_m, c_med_m, c_hi_m
-        base_lower = max(cost, c_lo * cost)
-        base_median = max(cost, c_med * cost)
-        base_upper = max(cost, c_hi * cost)
-        base_lower *= price_mult
-        base_median *= price_mult
-        base_upper *= price_mult
 
-        # New logic: optimize expected margin contribution by evaluating a price grid.
-        # This is done in a single batch to avoid repeated feature-building and
-        # classifier calls for every candidate price.
-        price_grid = np.linspace(
-            max(cost * 0.90, cost),
-            max(cost * 2.50, base_upper * 1.10),
-            8,
-        )
+        reg_lower = max(cost, c_lo * cost) * price_mult
+        reg_median = max(cost, c_med * cost) * price_mult
+        reg_upper = max(cost, c_hi * cost) * price_mult
+        reg_lower = min(reg_lower, reg_median)
+        reg_upper = max(reg_upper, reg_median)
 
-        rows = [
-            self._make_row(
-                client,
-                produit,
-                quantite,
-                source,
-                cout_total=cost,
-                prix_total=float(price),
-                saison=saison,
-                matiere=matiere,
-                format_dims=format_dims,
+        # Historical p75 accepted coeffs (ambitious-but-realistic ceiling for balanced)
+        # PB ≈ 1.57, LBFI ≈ 1.22 — stored as soft defaults if priors lack a p75.
+        priors_global = float((bundle.get("coeff_priors") or {}).get("global") or c_med)
+        hist_p75 = {
+            "ponceblanc": 1.57,
+            "lbfi": 1.22,
+        }.get(source, priors_global * 1.12)
+
+        def _grid_pick(grid_lo: float, grid_hi: float, n: int = 10):
+            grid_lo = max(float(grid_lo), cost * 1.02)
+            grid_hi = max(grid_lo * 1.01, float(grid_hi))
+            price_grid = np.linspace(grid_lo, grid_hi, n)
+            rows = [
+                self._make_row(
+                    client, produit, quantite, source,
+                    cout_total=cost, prix_total=float(price),
+                    saison=saison, matiere=matiere, format_dims=format_dims,
+                    fournisseur=fournisseur,
+                    pression_concurrentielle=pression_concurrentielle,
+                    marge_cible=marge_cible, delai_livraison=delai_livraison,
+                    month=month, year=year,
+                )
+                for price in price_grid
+            ]
+            rows_df = pd.concat(rows, ignore_index=True)
+            probabilities = self._predict_acceptance_batch(
+                rows_df, source,
+                saison=saison, matiere=matiere, format_dims=format_dims,
                 fournisseur=fournisseur,
                 pression_concurrentielle=pression_concurrentielle,
-                marge_cible=marge_cible,
-                delai_livraison=delai_livraison,
-                month=month,
-                year=year,
+                marge_cible=marge_cible, delai_livraison=delai_livraison,
             )
-            for price in price_grid
-        ]
-        rows_df = pd.concat(rows, ignore_index=True)
-        probabilities = self._predict_acceptance_batch(
-            rows_df,
-            source,
-            saison=saison,
-            matiere=matiere,
-            format_dims=format_dims,
-            fournisseur=fournisseur,
-            pression_concurrentielle=pression_concurrentielle,
-            marge_cible=marge_cible,
-            delai_livraison=delai_livraison,
-        )
+            margins = price_grid - cost
+            valid = margins > 0
+            scores = np.full_like(price_grid, -np.inf, dtype=float)
+            scores[valid] = probabilities[valid] * margins[valid]
+            idx = int(np.nanargmax(scores)) if np.any(valid) else int(
+                np.argmin(np.abs(price_grid - reg_median))
+            )
+            return (
+                float(price_grid[idx]),
+                float(probabilities[idx]),
+                float(scores[idx]) if valid[idx] else float("nan"),
+            )
 
-        margins = price_grid - cost
-        valid = margins > 0
-        scores = np.full_like(price_grid, -np.inf, dtype=float)
-        scores[valid] = probabilities[valid] * margins[valid]
-
-        idx = int(np.nanargmax(scores)) if np.any(valid) else 0
-        best_price = float(price_grid[idx])
-        best_proba = float(probabilities[idx])
-        best_score = float(scores[idx]) if valid[idx] else -np.inf
-
-        if not np.any(valid):
-            best_price = float(base_median)
-            best_proba = 0.5
-            best_score = -np.inf
-
-        best_price = float(np.clip(best_price * price_mult, cost * 0.90, max(cost * 2.50, base_upper * 1.10)))
-
-        lower = max(cost, min(base_lower, best_price * 0.95))
-        median = max(cost, best_price)
-        upper = max(cost, max(base_upper, best_price * 1.05))
+        if mode == "expected_margin":
+            try:
+                median, best_proba, best_score = _grid_pick(
+                    cost * max(lo_c, 1.02),
+                    cost * hi_c * price_mult,
+                    n=12,
+                )
+            except Exception:
+                median, best_proba, best_score = float(reg_median), float("nan"), float("nan")
+            lower = max(cost, min(reg_lower, median * 0.95))
+            upper = max(cost, max(reg_upper, median * 1.05))
+            result_mode = "expected_margin"
+        elif mode == "balanced":
+            # Ambitious but realistic: search only between the regressor price
+            # and min(+15 % uplift, historical p75 coeff). Never below the
+            # regressor median — we stay at least as ambitious as history.
+            cap_price = cost * min(hist_p75, hi_c) * price_mult
+            band_hi = min(max(reg_median * 1.15, reg_median), max(cap_price, reg_median))
+            band_lo = float(reg_median)
+            try:
+                median, best_proba, best_score = _grid_pick(band_lo, band_hi, n=8)
+            except Exception:
+                # Fallback: modest fixed uplift toward p75
+                target_coeff = min(c_med * 1.10, hist_p75)
+                median = max(cost, target_coeff * cost) * price_mult
+                best_proba, best_score = float("nan"), float("nan")
+                try:
+                    best_proba = float(
+                        self.predict_acceptance_proba(
+                            client=client, produit=produit, quantite=quantite,
+                            source=source, cout_total=cost, prix_total=median,
+                            saison=saison, matiere=matiere, format_dims=format_dims,
+                            fournisseur=fournisseur,
+                            pression_concurrentielle=pression_concurrentielle,
+                            marge_cible=marge_cible, delai_livraison=delai_livraison,
+                            month=month, year=year,
+                        )
+                    )
+                except Exception:
+                    pass
+            lower = max(cost, min(reg_lower, median * 0.95))
+            upper = max(cost, max(reg_upper, median * 1.05, band_hi))
+            result_mode = "balanced"
+        else:
+            lower, median, upper = float(reg_lower), float(reg_median), float(reg_upper)
+            best_score = float("nan")
+            try:
+                best_proba = float(
+                    self.predict_acceptance_proba(
+                        client=client, produit=produit, quantite=quantite,
+                        source=source, cout_total=cost, prix_total=median,
+                        saison=saison, matiere=matiere, format_dims=format_dims,
+                        fournisseur=fournisseur,
+                        pression_concurrentielle=pression_concurrentielle,
+                        marge_cible=marge_cible, delai_livraison=delai_livraison,
+                        month=month, year=year,
+                    )
+                )
+            except Exception:
+                best_proba = float("nan")
+            result_mode = "regressor_coeff"
 
         return {
             "target": "prix_total",
-            "mode": "expected_margin_grid",
+            "mode": result_mode,
+            "pricing_mode": mode,
             "prix_lower": float(lower),
             "prix_median": float(median),
             "prix_upper": float(upper),
@@ -507,9 +568,9 @@ class QuoteEstimator:
             "taux_lower": float((lower - cost) / cost) if cost > 0 else None,
             "taux_median": float((median - cost) / cost) if cost > 0 else None,
             "taux_upper": float((upper - cost) / cost) if cost > 0 else None,
-            "acceptance_probability": float(best_proba),
-            "expected_margin_score": float(best_score),
-            "legacy_coeff_fallback": {
+            "acceptance_probability": float(best_proba) if np.isfinite(best_proba) else None,
+            "expected_margin_score": float(best_score) if np.isfinite(best_score) else None,
+            "regressor_coeff": {
                 "coeff_low": float(c_lo),
                 "coeff_median": float(c_med),
                 "coeff_high": float(c_hi),
@@ -629,24 +690,28 @@ class QuoteEstimator:
             month=month, year=year,
         )
         center = float(recommendation["prix_median"])
+        cost = float(cout_total)
         if min_price is None:
-            min_price = max(cout_total, center * 0.60)
+            # From near cost — explore low margins too
+            min_price = max(cost * 1.02, cost)
         if max_price is None:
-            max_price = center * 1.40
+            # Wide range so the UI can probe high coeffs
+            # (up to ~4× cost or 3× recommendation, hard-capped at 500k €).
+            max_price = float(min(max(cost * 4.0, center * 3.0), 500_000.0))
         if step <= 0:
             raise ValueError("step must be > 0.")
 
-        # Cap number of points for UI speed (max ~25)
+        # Cap number of points for UI speed (max ~40)
         n = int(np.ceil((max_price - min_price) / step)) + 1
-        if n > 25:
-            step = (max_price - min_price) / 24.0
+        if n > 40:
+            step = (max_price - min_price) / 39.0
         prices = np.arange(min_price, max_price + step * 0.5, step)
         if len(prices) == 0:
             prices = np.array([center])
 
         probs = self._batch_price_grid(
             client, produit, quantite, source,
-            cout_total=float(cout_total),
+            cout_total=cost,
             prices=prices,
             saison=saison, matiere=matiere, format_dims=format_dims,
             fournisseur=fournisseur,
@@ -802,3 +867,244 @@ class QuoteEstimator:
             "threshold": thr,
             "coeff": float(prices[best_i] / cost) if cost > 0 else None,
         }
+
+    # -----------------------------------------------------------------
+    # CLIENT-ACCEPTANCE STRATEGIC PRICING (business policy layer)
+    # -----------------------------------------------------------------
+    #
+    # This block is intentionally separate from recommend_price(). It does
+    # NOT change what the model has learned; it applies a portfolio-level
+    # business decision on top of it: for clients whose smoothed historical
+    # acceptance rate sits in the bottom slice of the source's client base,
+    # quote a lower price aimed at a target P(accept), trading margin on
+    # THIS quote for a higher chance of winning the client -- on the
+    # assumption that the margin gap is recovered elsewhere in the
+    # portfolio. Nothing here is presented as "learned by the model".
+
+    def client_acceptance_rate(
+        self,
+        client: str,
+        source: str,
+    ) -> dict:
+        """
+        Smoothed historical acceptance rate for a client (same client_encoding
+        used by the classifier), plus the source-wide global rate for context.
+        Does not require cout_total / prix_total -- just looks up the client.
+        """
+        source = source.strip().lower()
+        bundle = self._load_source(source)
+        ce = bundle["client_encoding"]
+        global_rate = float(ce.get("__GLOBAL__", 0.0))
+        client_key = str(client).strip().upper()
+        known = client_key in ce
+        rate = float(ce.get(client_key, global_rate))
+        return {
+            "client": client_key,
+            "known": known,
+            "client_rate": rate,
+            "global_rate": global_rate,
+        }
+
+    def low_acceptance_threshold(
+        self,
+        source: str,
+        percentile: float = 25.0,
+    ) -> float | None:
+        """
+        Data-driven cutoff: the `percentile`-th percentile of smoothed
+        acceptance rates across all clients seen for this source. Clients
+        at or below this rate are considered "low acceptance". Returns
+        None if there is no client encoding to draw from.
+        """
+        source = source.strip().lower()
+        bundle = self._load_source(source)
+        ce = bundle["client_encoding"]
+        rates = np.array(
+            [v for k, v in ce.items() if k != "__GLOBAL__"],
+            dtype=float,
+        )
+        if rates.size == 0:
+            return None
+        return float(np.percentile(rates, percentile))
+
+    def list_low_acceptance_clients(
+        self,
+        source: str,
+        percentile: float = 25.0,
+        min_display: int = 0,
+    ) -> pd.DataFrame:
+        """
+        Inspection helper: shows exactly which clients fall at/below the
+        percentile threshold and at what smoothed rate, so the threshold
+        can be sanity-checked against real names before it drives pricing.
+        """
+        source = source.strip().lower()
+        bundle = self._load_source(source)
+        ce = bundle["client_encoding"]
+        threshold = self.low_acceptance_threshold(source, percentile)
+        rows = [
+            {"client": k, "client_rate": float(v)}
+            for k, v in ce.items()
+            if k != "__GLOBAL__"
+        ]
+        df = pd.DataFrame(rows).sort_values("client_rate")
+        if threshold is not None:
+            df = df[df["client_rate"] <= threshold]
+        if min_display:
+            df = df.head(min_display)
+        df["threshold_used"] = threshold
+        df["global_rate"] = ce.get("__GLOBAL__")
+        return df.reset_index(drop=True)
+
+    def is_low_acceptance_client(
+        self,
+        client: str,
+        source: str,
+        percentile: float = 25.0,
+    ) -> tuple[bool, float, float | None]:
+        info = self.client_acceptance_rate(client, source)
+        threshold = self.low_acceptance_threshold(source, percentile)
+        if threshold is None:
+            return False, info["client_rate"], None
+        return (info["client_rate"] <= threshold), info["client_rate"], threshold
+
+    def recommend_price_strategic(
+        self,
+        client: str,
+        produit: str,
+        quantite: float,
+        source: str,
+        *,
+        cout_total: float,
+        pricing_mode: str = "balanced",
+        low_acceptance_percentile: float = 25.0,
+        max_discount_pct: float = 0.40,
+        min_discount_pct: float = 0.15,
+        min_coeff: float = 1.05,
+        saison: str | None = None,
+        matiere: str | None = None,
+        format_dims: str | None = None,
+        fournisseur: str | None = None,
+        pression_concurrentielle: float | int | None = None,
+        marge_cible: float | int | None = None,
+        delai_livraison: float | int | None = None,
+        month: int | float | None = None,
+        year: int | float | None = None,
+    ) -> dict:
+        """
+        Client-acquisition pricing strategy — portfolio policy layer, not a
+        model prediction.
+
+        For most clients this returns the same recommendation as
+        recommend_price(), with strategic_pricing_applied=False.
+
+        For a client whose smoothed acceptance rate falls at/below the
+        `low_acceptance_percentile` of this source's client base, it
+        **forces a lower margin** by applying a severity-based discount
+        on the baseline recommended price:
+
+            severity = (threshold − client_rate) / threshold   ∈ [0, 1]
+            discount = min_discount + severity × (max_discount − min_discount)
+
+        Defaults: 15 % minimum discount → up to 40 % for the worst clients.
+        Price is never allowed below cost × min_coeff (default 1.05).
+
+        This does NOT rely on the classifier's price elasticity (which can
+        be weak or inverted for some clients). It is an explicit business
+        rule: trade margin on this quote to improve the chance of winning
+        a historically hard client.
+        """
+        source = source.strip().lower()
+        cost = float(cout_total)
+        if cost <= 0:
+            raise ValueError(f"{source} needs cout_total > 0 €.")
+
+        baseline = self.recommend_price(
+            client, produit, quantite, source,
+            cout_total=cost,
+            pricing_mode=pricing_mode,
+            saison=saison, matiere=matiere, format_dims=format_dims,
+            fournisseur=fournisseur,
+            pression_concurrentielle=pression_concurrentielle,
+            marge_cible=marge_cible, delai_livraison=delai_livraison,
+            month=month, year=year,
+        )
+
+        is_low, client_rate, threshold = self.is_low_acceptance_client(
+            client, source, low_acceptance_percentile
+        )
+
+        result = dict(baseline)
+        result["client_acceptance_rate"] = client_rate
+        result["low_acceptance_threshold"] = threshold
+        result["strategic_pricing_applied"] = False
+
+        if not is_low:
+            return result
+
+        baseline_price = float(baseline["prix_median"])
+        if baseline_price <= cost:
+            result["strategic_note"] = (
+                "Client flagged as low-acceptance, but baseline price is "
+                "already at/near cost — no discount room."
+            )
+            return result
+
+        # Severity: 0 at the threshold, 1 when rate → 0
+        if threshold and threshold > 0:
+            severity = float(np.clip((threshold - client_rate) / threshold, 0.0, 1.0))
+        else:
+            severity = 0.5
+
+        min_d = float(min_discount_pct)
+        max_d = float(max_discount_pct)
+        if max_d < min_d:
+            max_d = min_d
+        discount = min_d + severity * (max_d - min_d)
+
+        # Floor: never go below cost × min_coeff
+        floor_price = cost * float(min_coeff)
+        strategic_price = max(floor_price, baseline_price * (1.0 - discount))
+
+        # If floor already ≥ baseline, nothing to do
+        if strategic_price >= baseline_price - 1e-6:
+            result["strategic_note"] = (
+                "Client flagged as low-acceptance, but baseline is already "
+                "near the cost floor — no further discount applied."
+            )
+            return result
+
+        actual_discount = (baseline_price - strategic_price) / baseline_price
+
+        # Recompute P(accept) at the strategic price for display
+        try:
+            strategic_proba = float(
+                self.predict_acceptance_proba(
+                    client=client,
+                    produit=produit,
+                    quantite=quantite,
+                    source=source,
+                    cout_total=cost,
+                    prix_total=strategic_price,
+                    month=month,
+                    year=year,
+                )
+            )
+        except Exception:
+            strategic_proba = result.get("acceptance_probability")
+
+        result.update({
+            "prix_median": float(strategic_price),
+            "prix_lower": float(min(float(result.get("prix_lower", strategic_price)), strategic_price)),
+            "prix_upper": float(result.get("prix_upper", strategic_price)),
+            "acceptance_probability": strategic_proba,
+            "coeff_median": float(strategic_price / cost) if cost > 0 else None,
+            "taux_median": float((strategic_price - cost) / cost) if cost > 0 else None,
+            "strategic_pricing_applied": True,
+            "strategic_severity": float(severity),
+            "strategic_baseline_price": baseline_price,
+            "strategic_discount_pct": float(actual_discount),
+            "strategic_target_proba": None,
+            "strategic_target_reached": None,
+        })
+        return result
