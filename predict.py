@@ -28,6 +28,27 @@ import features
 
 MODELS_DIR = Path("models")
 
+# ---------------------------------------------------------------------
+# BUSINESS-REALISTIC MARGIN GUARDRAILS
+# ---------------------------------------------------------------------
+# The regressor's own coeff_clip (fit from data quantiles at train time) can
+# be much wider than what's commercially sane. These two constants enforce
+# a hard, non-negotiable "down to earth" margin coefficient band on every
+# recommended price, on top of (never wider than) whatever the model learned.
+REALISTIC_COEFF_MIN = 1.20
+REALISTIC_COEFF_MAX = 1.80
+
+# The classifier can keep predicting a plausible-looking P(accept) far
+# outside the price range it was ever trained on (models don't know they're
+# extrapolating). To stop "very high price + very high acceptance" outputs,
+# acceptance probability is forced to decay to 0 as the candidate price's
+# coeff (prix_total / cout_total) moves past the realistic band:
+#   coeff <= ACCEPTANCE_DECAY_START            -> no penalty
+#   ACCEPTANCE_DECAY_START < coeff < ACCEPTANCE_DECAY_ZERO -> linear decay
+#   coeff >= ACCEPTANCE_DECAY_ZERO              -> probability forced to 0
+ACCEPTANCE_DECAY_START = REALISTIC_COEFF_MAX          # 1.80
+ACCEPTANCE_DECAY_ZERO = REALISTIC_COEFF_MAX + 0.70     # 2.50
+
 
 class QuoteEstimator:
 
@@ -227,6 +248,21 @@ class QuoteEstimator:
                 rows = rows.copy()
                 rows[col] = val
 
+        # Realistic-price decay factor, computed from the *raw* euro columns
+        # before build_feature_matrix() log-transforms them.
+        _cost = pd.to_numeric(rows["cout_total"], errors="coerce").to_numpy(dtype=float)
+        _price = pd.to_numeric(rows["prix_total"], errors="coerce").to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            _coeff = np.where(_cost > 0, _price / _cost, np.nan)
+        _span = ACCEPTANCE_DECAY_ZERO - ACCEPTANCE_DECAY_START
+        _decay = np.where(
+            _coeff <= ACCEPTANCE_DECAY_START,
+            1.0,
+            np.clip((ACCEPTANCE_DECAY_ZERO - _coeff) / _span, 0.0, 1.0),
+        )
+        # Unknown coeff (missing cost/price) -> no penalty, let the classifier decide
+        _decay = np.where(np.isnan(_coeff), 1.0, _decay)
+
         X = features.build_feature_matrix(
             rows,
             bundle["product_clusters"],
@@ -256,7 +292,7 @@ class QuoteEstimator:
             format_dims=format_dims,
             fournisseur=fournisseur,
         )
-        return np.clip(base_proba * proba_mult, 0.0, 0.9999)
+        return np.clip(base_proba * proba_mult * _decay, 0.0, 0.9999)
 
     def predict_acceptance_proba(
         self,
@@ -421,6 +457,12 @@ class QuoteEstimator:
         )
         lo_c, hi_c = bundle.get("coeff_clip") or [0.80, 4.00]
         lo_c, hi_c = float(lo_c), float(hi_c)
+        # Hard business guardrail: never recommend a margin coefficient outside
+        # [1.20, 1.80], regardless of what the trained clip allows.
+        lo_c = max(lo_c, REALISTIC_COEFF_MIN)
+        hi_c = min(hi_c, REALISTIC_COEFF_MAX)
+        if lo_c > hi_c:
+            lo_c, hi_c = REALISTIC_COEFF_MIN, REALISTIC_COEFF_MAX
         transform = bundle.get("target_transform", "identity")
         blend = float(bundle.get("small_n_blend") or 0.0)
 
@@ -456,6 +498,7 @@ class QuoteEstimator:
             "ponceblanc": 1.57,
             "lbfi": 1.22,
         }.get(source, priors_global * 1.12)
+        hist_p75 = float(np.clip(hist_p75, REALISTIC_COEFF_MIN, REALISTIC_COEFF_MAX))
 
         def _grid_pick(grid_lo: float, grid_hi: float, n: int = 10):
             grid_lo = max(float(grid_lo), cost * 1.02)
