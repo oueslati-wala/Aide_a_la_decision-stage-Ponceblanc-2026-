@@ -246,12 +246,12 @@ def fmt_eur(x: float | int | None, decimals: int = 0) -> str:
 
 
 @st.cache_resource
-def get_estimator(_version: int = 16):
+def get_estimator(_version: int = 17):
     return QuoteEstimator()
 
 
 @st.cache_data
-def get_history(source: str, _version: int = 16) -> pd.DataFrame:
+def get_history(source: str, _version: int = 17) -> pd.DataFrame:
     try:
         df = features.build_source(source)
         if df is None:
@@ -295,8 +295,8 @@ def cached_recommend(
     month: int | None,
     year: int | None,
     low_acceptance_percentile: float = 25.0,
-    pricing_mode: str = "balanced",
-    _version: int = 23,
+    pricing_mode: str = "expected_margin",
+    _version: int = 24,
 ):
     """Cache price recommendation for identical inputs (fast UI).
     month/year may be None when the user disables date/season.
@@ -305,7 +305,9 @@ def cached_recommend(
     historical acceptance rates get a deliberately lower margin (higher
     chance of winning the quote). The percentile defines that slice.
 
-    pricing_mode: "balanced" (default), "regressor", or "expected_margin".
+    pricing_mode: fixed to "expected_margin" — the UI no longer exposes a
+    choice. predict.py constrains its coefficient search to the realistic
+    band [REALISTIC_COEFF_MIN, REALISTIC_COEFF_MAX] = [1.20, 1.80].
     """
     est = get_estimator()
     rec = est.recommend_price_strategic(
@@ -821,29 +823,16 @@ if page == "Aide à la décision":
             "Les scénarios ajoutent alors une ligne **Acquisition (marge mini ≈ +10 %)**."
         )
 
-    pricing_mode_label = st.radio(
-        "Mode de pricing",
-        [
-            "Équilibré (ambitieux réaliste)",
-            "Régressor (marge historique)",
-            "Marge espérée (P × marge)",
-        ],
-        index=0,
-        horizontal=True,
-        key=f"pricing_mode_{source}",
-        help=(
-            "Équilibré (défaut) : part du coeff historique, puis monte un peu "
-            "(jusqu'à +15 % / p75 des acceptés) si la proba le permet. "
-            "Régressor : strictement le coeff prédit (médiane ≈ 1,37 PB / 1,15 LBFI). "
-            "Marge espérée : maximise P×marge jusqu'au clip du modèle (le plus haut)."
-        ),
+    # Pricing mode is fixed to "expected_margin" (maximise P(acceptation) x
+    # marge) -- the earlier 3-way "Mode de pricing" selector was removed.
+    # The coefficient search is constrained to a realistic band, 1,20x–1,80x
+    # le coût, enforced in predict.py via REALISTIC_COEFF_MIN/MAX.
+    pricing_mode = "expected_margin"
+    st.caption(
+        "Mode de pricing : **Marge espérée (P × marge)** — le prix maximise "
+        "P(acceptation) × marge, dans une plage de coefficient réaliste "
+        "**1,20× – 1,80×** le coût."
     )
-    if pricing_mode_label.startswith("Équilibré"):
-        pricing_mode = "balanced"
-    elif pricing_mode_label.startswith("Régressor"):
-        pricing_mode = "regressor"
-    else:
-        pricing_mode = "expected_margin"
 
     similar = filter_similar(history, client, produit, quantite, qty_tol=float(qty_band))
 
@@ -919,11 +908,7 @@ if page == "Aide à la décision":
                 delta=marge_delta,
             )
 
-            mode_txt = {
-                "balanced": "mode équilibré (ambitieux réaliste)",
-                "regressor": "mode régressor (coeff historique)",
-                "expected_margin": "mode marge espérée (P × marge)",
-            }.get(pricing_mode, f"mode {pricing_mode}")
+            mode_txt = "mode marge espérée (P × marge, coeff 1,20×–1,80×)"
             st.success(
                 f"{probability_label(proba_reco)} — Prix recommandé : "
                 f"**{fmt_eur(prix_recommande)}** "
@@ -1479,32 +1464,55 @@ Entrées **uniquement** :
         st.caption(
             f"Tri par priorité : **1** client+produit+qté (±{qty_band:.0%}) → "
             f"**2** client+produit → **3** même client. "
-            f"Affiche jusqu'à **20** / **{n_sim}** devis."
+            f"Affiche les **{n_sim}** devis correspondants."
         )
 
-        cols = [c for c in [ "devis_code", "client", "produit", "quantite", "cout_total", "prix_total", "prix_unitaire", "signe"] if c in similar.columns]
-        disp = similar[cols].head(20).copy()
+        # "produit" = product type / name (e.g. LIASSE, COLLECTION) — this is
+        # the product reference shown here, never "matiere" (raw material),
+        # which is a separate, unrelated field. "reference_client" is the
+        # "Référence client" column from Query_tableau_devis_with_costs.xlsx.
+        # "taux_marge" is the margin field EXTRACTED DIRECTLY from the
+        # Ponceblanc Excel's own "Taux Marge" column (see
+        # standardize_ponceblanc in features.py) — nothing is calculated
+        # here. LBFI's raw extract never has this field (business rule:
+        # LBFI margin is not used — see standardize_lbfi), so it shows "—".
+        cols = [c for c in [ "devis_code", "reference_client", "client", "produit", "quantite", "cout_total", "prix_total", "prix_unitaire", "taux_marge", "signe"] if c in similar.columns]
+        disp = similar[cols].copy()
+
         if "cout_total" in disp:
             disp["cout_total"] = disp["cout_total"].map(fmt_eur)
         if "prix_total" in disp:
             disp["prix_total"] = disp["prix_total"].map(fmt_eur)
         if "prix_unitaire" in disp:
             disp["prix_unitaire"] = disp["prix_unitaire"].map(lambda v: f"{float(v):,.4f} €".replace(",", " ") if pd.notna(v) else "—")
+        if "taux_marge" in disp:
+            disp["taux_marge"] = disp["taux_marge"].map(
+                lambda v: fmt_coefficient(float(v)) if pd.notna(v) else "—"
+            )
+        if "reference_client" in disp:
+            disp["reference_client"] = disp["reference_client"].fillna("—")
         if "signe" in disp:
             disp["signe"] = disp["signe"].map({1: "Accepté", 0: "Refusé"})
         disp = disp.rename(columns={
             "devis_code": "Devis",
+            "reference_client": "Référence client",
             "client": "Client",
             "produit": "Produit",
             "quantite": "Quantité",
             "cout_total": "Coût total",
             "prix_total": "Prix total",
             "prix_unitaire": "Prix unitaire",
+            "taux_marge": "Coefficient (marge)",
             "signe": "Résultat",
         })
         st.dataframe(disp, width="stretch", hide_index=True)
-        if n_sim > 20:
-            st.caption(f"… et {n_sim - 20} autres non affichés (affinez les filtres pour réduire).")
+        if "Coefficient (marge)" in disp.columns:
+            st.caption(
+                "**Coefficient (marge)** = valeur extraite directement de la colonne "
+                "« Taux Marge » du fichier Excel Ponceblanc d'origine — aucun calcul "
+                "n'est fait ici. LBFI n'a pas ce champ dans son extrait source, d'où "
+                "les « — »."
+            )
 
 
 # ===========================================================================

@@ -61,6 +61,7 @@ UNIFIED_COLUMNS = [
     "devis_code",
     "source",
     "client",
+    "reference_client",
     "produit",
     "quantite",
     "taux_marge",
@@ -185,6 +186,24 @@ def _find_col(
         f"Expected header containing {must_contain!r}. "
         f"Actual columns: {list(columns)}"
     )
+
+
+def _find_col_optional(
+    columns,
+    must_contain: list[str],
+):
+    """Same matching as _find_col, but returns None instead of raising when
+    no header matches -- used for fields that may not exist in every raw
+    extract (e.g. a source-specific column) without breaking the pipeline."""
+
+    for column in columns:
+
+        low = str(column).strip().lower()
+
+        if all(part in low for part in must_contain):
+            return column
+
+    return None
 
 
 def _find_sheet_name(
@@ -477,6 +496,20 @@ def standardize_ponceblanc(
         df["Nom Client"]
     )
 
+    ref_client_col = _find_col_optional(
+        df.columns,
+        ["référence", "client"],
+    )
+    if ref_client_col is not None:
+        out["reference_client"] = (
+            df[ref_client_col]
+            .astype(str)
+            .str.strip()
+            .replace({"nan": np.nan, "None": np.nan, "": np.nan})
+        )
+    else:
+        out["reference_client"] = np.nan
+
     out["produit"] = normalize_produit_series(
         _clean_text(df["Type de produit"])
     )
@@ -621,6 +654,20 @@ def standardize_lbfi(
     out["client"] = _clean_text(
         df["Nom Client"]
     )
+
+    ref_client_col = _find_col_optional(
+        df.columns,
+        ["référence", "client"],
+    )
+    if ref_client_col is not None:
+        out["reference_client"] = (
+            df[ref_client_col]
+            .astype(str)
+            .str.strip()
+            .replace({"nan": np.nan, "None": np.nan, "": np.nan})
+        )
+    else:
+        out["reference_client"] = np.nan
 
     out["produit"] = normalize_produit_series(
         _clean_text(df["Type de produit"])
