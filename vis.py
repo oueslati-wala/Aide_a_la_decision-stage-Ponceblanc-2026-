@@ -1506,13 +1506,7 @@ Entrées **uniquement** :
             "signe": "Résultat",
         })
         st.dataframe(disp, width="stretch", hide_index=True)
-        if "Coefficient (marge)" in disp.columns:
-            st.caption(
-                "**Coefficient (marge)** = valeur extraite directement de la colonne "
-                "« Taux Marge » du fichier Excel Ponceblanc d'origine — aucun calcul "
-                "n'est fait ici. LBFI n'a pas ce champ dans son extrait source, d'où "
-                "les « — »."
-            )
+        
 
 
 # ===========================================================================
