@@ -21,12 +21,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 import features
 from predict import QuoteEstimator
+
+# Optional decay constants (present in newer predict.py). Fallback keeps the
+# chart usable even if the module does not export them yet.
+try:
+    from predict import ACCEPTANCE_DECAY_START, ACCEPTANCE_DECAY_ZERO
+except ImportError:
+    ACCEPTANCE_DECAY_START = 3.0
+    ACCEPTANCE_DECAY_ZERO = 5.0
 
 st.set_page_config(page_title="Estimateur d'offres", layout="wide", page_icon="🧾")
 
@@ -246,12 +255,12 @@ def fmt_eur(x: float | int | None, decimals: int = 0) -> str:
 
 
 @st.cache_resource
-def get_estimator(_version: int = 17):
+def get_estimator(_version: int = 16):
     return QuoteEstimator()
 
 
 @st.cache_data
-def get_history(source: str, _version: int = 17) -> pd.DataFrame:
+def get_history(source: str, _version: int = 16) -> pd.DataFrame:
     try:
         df = features.build_source(source)
         if df is None:
@@ -295,8 +304,8 @@ def cached_recommend(
     month: int | None,
     year: int | None,
     low_acceptance_percentile: float = 25.0,
-    pricing_mode: str = "expected_margin",
-    _version: int = 24,
+    pricing_mode: str = "balanced",
+    _version: int = 23,
 ):
     """Cache price recommendation for identical inputs (fast UI).
     month/year may be None when the user disables date/season.
@@ -305,9 +314,7 @@ def cached_recommend(
     historical acceptance rates get a deliberately lower margin (higher
     chance of winning the quote). The percentile defines that slice.
 
-    pricing_mode: fixed to "expected_margin" — the UI no longer exposes a
-    choice. predict.py constrains its coefficient search to the realistic
-    band [REALISTIC_COEFF_MIN, REALISTIC_COEFF_MAX] = [1.20, 1.80].
+    pricing_mode: "balanced" (default), "regressor", or "expected_margin".
     """
     est = get_estimator()
     rec = est.recommend_price_strategic(
@@ -823,16 +830,29 @@ if page == "Aide à la décision":
             "Les scénarios ajoutent alors une ligne **Acquisition (marge mini ≈ +10 %)**."
         )
 
-    # Pricing mode is fixed to "expected_margin" (maximise P(acceptation) x
-    # marge) -- the earlier 3-way "Mode de pricing" selector was removed.
-    # The coefficient search is constrained to a realistic band, 1,20x–1,80x
-    # le coût, enforced in predict.py via REALISTIC_COEFF_MIN/MAX.
-    pricing_mode = "expected_margin"
-    st.caption(
-        "Mode de pricing : **Marge espérée (P × marge)** — le prix maximise "
-        "P(acceptation) × marge, dans une plage de coefficient réaliste "
-        "**1,20× – 1,80×** le coût."
+    pricing_mode_label = st.radio(
+        "Mode de pricing",
+        [
+            "Équilibré (ambitieux réaliste)",
+            "Régressor (marge historique)",
+            "Marge espérée (P × marge)",
+        ],
+        index=0,
+        horizontal=True,
+        key=f"pricing_mode_{source}",
+        help=(
+            "Équilibré (défaut) : part du coeff historique, puis monte un peu "
+            "(jusqu'à +15 % / p75 des acceptés) si la proba le permet. "
+            "Régressor : strictement le coeff prédit (médiane ≈ 1,37 PB / 1,15 LBFI). "
+            "Marge espérée : maximise P×marge jusqu'au clip du modèle (le plus haut)."
+        ),
     )
+    if pricing_mode_label.startswith("Équilibré"):
+        pricing_mode = "balanced"
+    elif pricing_mode_label.startswith("Régressor"):
+        pricing_mode = "regressor"
+    else:
+        pricing_mode = "expected_margin"
 
     similar = filter_similar(history, client, produit, quantite, qty_tol=float(qty_band))
 
@@ -908,7 +928,11 @@ if page == "Aide à la décision":
                 delta=marge_delta,
             )
 
-            mode_txt = "mode marge espérée (P × marge, coeff 1,20×–1,80×)"
+            mode_txt = {
+                "balanced": "mode équilibré (ambitieux réaliste)",
+                "regressor": "mode régressor (coeff historique)",
+                "expected_margin": "mode marge espérée (P × marge)",
+            }.get(pricing_mode, f"mode {pricing_mode}")
             st.success(
                 f"{probability_label(proba_reco)} — Prix recommandé : "
                 f"**{fmt_eur(prix_recommande)}** "
@@ -1394,6 +1418,32 @@ Entrées **uniquement** :
                 step=0.05,
                 key=f"sens_min_coeff_{source}",
             )
+
+        st.markdown("**Sensibilité à la quantité**")
+        cq1, cq2 = st.columns(2)
+        with cq1:
+            qty_test_price = st.number_input(
+                "Prix à tester pour la courbe quantité (€)",
+                min_value=0.0,
+                value=round(float(prix_recommande), 2),
+                step=50.0,
+                key=f"qty_sens_price_{source}",
+                help=(
+                    "La courbe quantité fixe ce prix et fait varier la quantité. "
+                    "Changez ce prix pour voir comment la sensibilité à la "
+                    "quantité se déforme selon le niveau de prix testé."
+                ),
+            )
+        with cq2:
+            qty_max_mult = st.number_input(
+                "Quantité max testée (× quantité actuelle)",
+                min_value=1.2,
+                max_value=10.0,
+                value=3.0,
+                step=0.5,
+                key=f"qty_sens_max_{source}",
+            )
+
         try:
             sens_min_price = float(cout_total) * float(sens_min_coeff)
             sens_max_price = float(cout_total) * float(sens_max_coeff)
@@ -1413,15 +1463,173 @@ Entrées **uniquement** :
             )
             curve = curve.copy()
             curve["coeff"] = curve["prix_total"] / float(cout_total)
-            chart = curve.set_index("prix_total")[["acceptance_proba"]].rename(
-                columns={"acceptance_proba": "P(acceptation)"}
+            curve["courbe"] = "Prix"
+
+            # Quantity sensitivity, held price fixed at qty_test_price.
+            qty_min = max(1.0, float(quantite) * 0.2)
+            qty_max = max(qty_min * 1.05, float(quantite) * float(qty_max_mult))
+            qty_grid = np.linspace(qty_min, qty_max, 20)
+            qty_rows = [
+                est._make_row(
+                    client, produit, float(q), source,
+                    cout_total=cout_total, prix_total=float(qty_test_price),
+                    matiere=matiere, month=month, year=year,
+                )
+                for q in qty_grid
+            ]
+            qty_probs = est._predict_acceptance_batch(
+                pd.concat(qty_rows, ignore_index=True), source, matiere=matiere,
             )
-            chart.index.name = "Prix de vente total (€)"
-            st.line_chart(chart)
+            qty_curve = pd.DataFrame({
+                "quantite": qty_grid,
+                "acceptance_proba": qty_probs,
+                "courbe": "Quantité",
+                "prix_fixe": float(qty_test_price),
+            })
+
+            # Divider: start of the artificial "unrealistic" decay zone
+            # (see ACCEPTANCE_DECAY_START in predict.py).
+            divider_price = float(cout_total) * ACCEPTANCE_DECAY_START
+            zero_price = float(cout_total) * ACCEPTANCE_DECAY_ZERO
+            show_divider = sens_min_price <= divider_price <= sens_max_price
+
+            # Dual x-axis: price on bottom (terracotta), quantity on top (sage).
+            # Explicit scale domains + resolve_axis keep BOTH number sets visible.
+            y_shared = alt.Y(
+                "acceptance_proba:Q",
+                title="P(acceptation)",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(
+                    format="%",
+                    titleColor="#2B241C",
+                    labelColor="#746553",
+                    tickCount=6,
+                ),
+            )
+
+            price_tooltip = [
+                alt.Tooltip("courbe:N", title="Courbe"),
+                alt.Tooltip("prix_total:Q", title="Prix (€)", format=",.0f"),
+                alt.Tooltip("coeff:Q", title="Coeff", format=".2f"),
+                alt.Tooltip("acceptance_proba:Q", title="P(accept)", format=".0%"),
+            ]
+            qty_tooltip = [
+                alt.Tooltip("courbe:N", title="Courbe"),
+                alt.Tooltip("quantite:Q", title="Quantité", format=",.0f"),
+                alt.Tooltip("prix_fixe:Q", title="Prix fixé (€)", format=",.0f"),
+                alt.Tooltip("acceptance_proba:Q", title="P(accept)", format=".0%"),
+            ]
+
+            price_scale = alt.Scale(domain=[float(sens_min_price), float(sens_max_price)])
+            qty_scale = alt.Scale(domain=[float(qty_min), float(qty_max)])
+
+            # Bottom axis = price (terracotta)
+            price_line = (
+                alt.Chart(curve)
+                .mark_line(color="#A9552F", strokeWidth=2.5)
+                .encode(
+                    x=alt.X(
+                        "prix_total:Q",
+                        scale=price_scale,
+                        axis=alt.Axis(
+                            title="Prix de vente total (€)",
+                            format=",.0f",
+                            tickCount=6,
+                            titleColor="#A9552F",
+                            labelColor="#A9552F",
+                            tickColor="#A9552F",
+                            domainColor="#A9552F",
+                            grid=True,
+                            gridOpacity=0.2,
+                            orient="bottom",
+                        ),
+                    ),
+                    y=y_shared,
+                    tooltip=price_tooltip,
+                )
+            )
+            price_pts = (
+                alt.Chart(curve)
+                .mark_circle(size=80, opacity=0.01)
+                .encode(
+                    x=alt.X("prix_total:Q", scale=price_scale, axis=None),
+                    y=y_shared,
+                    tooltip=price_tooltip,
+                )
+            )
+
+            # Top axis = quantity (sage)
+            qty_line = (
+                alt.Chart(qty_curve)
+                .mark_line(color="#64735A", strokeWidth=2.5, strokeDash=[5, 3])
+                .encode(
+                    x=alt.X(
+                        "quantite:Q",
+                        scale=qty_scale,
+                        axis=alt.Axis(
+                            title="Quantité (à prix fixe)",
+                            format=",.0f",
+                            tickCount=6,
+                            titleColor="#64735A",
+                            labelColor="#64735A",
+                            tickColor="#64735A",
+                            domainColor="#64735A",
+                            grid=False,
+                            orient="top",
+                        ),
+                    ),
+                    y=y_shared,
+                    tooltip=qty_tooltip,
+                )
+            )
+            qty_pts = (
+                alt.Chart(qty_curve)
+                .mark_circle(size=80, opacity=0.01)
+                .encode(
+                    x=alt.X("quantite:Q", scale=qty_scale, axis=None),
+                    y=y_shared,
+                    tooltip=qty_tooltip,
+                )
+            )
+
+            layers = [price_line, price_pts, qty_line, qty_pts]
+            if show_divider:
+                divider_df = pd.DataFrame({"prix_total": [divider_price]})
+                divider_rule = (
+                    alt.Chart(divider_df)
+                    .mark_rule(color="#A2483E", strokeWidth=1.5, strokeDash=[6, 4])
+                    .encode(
+                        x=alt.X("prix_total:Q", scale=price_scale, axis=None),
+                    )
+                )
+                layers.append(divider_rule)
+
+            combined = (
+                alt.layer(*layers)
+                .resolve_scale(x="independent")
+                .resolve_axis(x="independent")
+                .properties(height=400)
+            )
+            st.altair_chart(combined, use_container_width=True)
+
+            legend_bits = [
+                "🟠 **Prix** (axe bas, couleur terracotta) · "
+                "🟢 **Quantité** (axe haut, pointillé sage — prix fixé à "
+                f"{fmt_eur(qty_test_price)})",
+            ]
+            if show_divider:
+                legend_bits.append(
+                    f"🔴 pointillé rouge = début de la zone jugée irréaliste "
+                    f"(coeff ≥ {ACCEPTANCE_DECAY_START:.2f}× ≈ {fmt_eur(divider_price)}) : "
+                    f"P(accept) est artificiellement ramenée à 0 à coeff "
+                    f"{ACCEPTANCE_DECAY_ZERO:.2f}× ({fmt_eur(zero_price)})."
+                )
+            st.caption(" · ".join(legend_bits))
             st.caption(
-                f"Plage : {fmt_eur(sens_min_price)} → {fmt_eur(sens_max_price)} "
-                f"(coeff {float(sens_min_coeff):.2f}× → {float(sens_max_coeff):.2f}×). "
-                f"{len(curve)} points."
+                f"Plage prix : {fmt_eur(sens_min_price)} → {fmt_eur(sens_max_price)} "
+                f"(coeff {float(sens_min_coeff):.2f}× → {float(sens_max_coeff):.2f}×), "
+                f"{len(curve)} points. Plage quantité : {qty_min:,.0f} → {qty_max:,.0f}."
+                .replace(",", " ")
             )
         except (ValueError, AttributeError) as exc:
             st.error(str(exc))
@@ -1464,33 +1672,46 @@ Entrées **uniquement** :
         st.caption(
             f"Tri par priorité : **1** client+produit+qté (±{qty_band:.0%}) → "
             f"**2** client+produit → **3** même client. "
-            f"Affiche les **{n_sim}** devis correspondants."
+            f"Affiche jusqu'à **20** / **{n_sim}** devis."
         )
 
-        # "produit" = product type / name (e.g. LIASSE, COLLECTION) — this is
-        # the product reference shown here, never "matiere" (raw material),
-        # which is a separate, unrelated field. "reference_client" is the
-        # "Référence client" column from Query_tableau_devis_with_costs.xlsx.
-        # "taux_marge" is the margin field EXTRACTED DIRECTLY from the
-        # Ponceblanc Excel's own "Taux Marge" column (see
-        # standardize_ponceblanc in features.py) — nothing is calculated
-        # here. LBFI's raw extract never has this field (business rule:
-        # LBFI margin is not used — see standardize_lbfi), so it shows "—".
-        cols = [c for c in [ "devis_code", "reference_client", "client", "produit", "quantite", "cout_total", "prix_total", "prix_unitaire", "taux_marge", "signe"] if c in similar.columns]
-        disp = similar[cols].copy()
-
+        # Column order matches the decision-support table:
+        # Devis | Référence client | Client | Produit | Matière | Quantité |
+        # Coût total | Prix total | Prix unitaire | Coefficient (marge) | Résultat
+        cols = [
+            c
+            for c in [
+                "devis_code",
+                "reference_client",
+                "client",
+                "produit",
+                "matiere",
+                "quantite",
+                "cout_total",
+                "prix_total",
+                "prix_unitaire",
+                "taux_marge",
+                "signe",
+            ]
+            if c in similar.columns
+        ]
+        disp = similar[cols].head(20).copy()
         if "cout_total" in disp:
             disp["cout_total"] = disp["cout_total"].map(fmt_eur)
         if "prix_total" in disp:
             disp["prix_total"] = disp["prix_total"].map(fmt_eur)
         if "prix_unitaire" in disp:
-            disp["prix_unitaire"] = disp["prix_unitaire"].map(lambda v: f"{float(v):,.4f} €".replace(",", " ") if pd.notna(v) else "—")
+            disp["prix_unitaire"] = disp["prix_unitaire"].map(
+                lambda v: f"{float(v):,.4f} €".replace(",", " ") if pd.notna(v) else "—"
+            )
         if "taux_marge" in disp:
             disp["taux_marge"] = disp["taux_marge"].map(
                 lambda v: fmt_coefficient(float(v)) if pd.notna(v) else "—"
             )
         if "reference_client" in disp:
             disp["reference_client"] = disp["reference_client"].fillna("—")
+        if "matiere" in disp:
+            disp["matiere"] = disp["matiere"].fillna("—")
         if "signe" in disp:
             disp["signe"] = disp["signe"].map({1: "Accepté", 0: "Refusé"})
         disp = disp.rename(columns={
@@ -1498,6 +1719,7 @@ Entrées **uniquement** :
             "reference_client": "Référence client",
             "client": "Client",
             "produit": "Produit",
+            "matiere": "Matière",
             "quantite": "Quantité",
             "cout_total": "Coût total",
             "prix_total": "Prix total",
@@ -1506,7 +1728,8 @@ Entrées **uniquement** :
             "signe": "Résultat",
         })
         st.dataframe(disp, width="stretch", hide_index=True)
-        
+        if n_sim > 20:
+            st.caption(f"… et {n_sim - 20} autres non affichés (affinez les filtres pour réduire).")
 
 
 # ===========================================================================

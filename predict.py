@@ -28,24 +28,16 @@ import features
 
 MODELS_DIR = Path("models")
 
-# "Marge espérée" (expected_margin) is now the ONLY pricing mode exposed in
-# the UI (the "Mode de pricing" selector was removed). Its coefficient
-# search is constrained to this realistic band rather than the model's full
-# trained coeff_clip (which can run up to ~3.00x on historical p95 accepted
-# quotes) -- the business wants recommendations to stay inside a coefficient
-# range that's been validated as sane, not just "technically seen before".
-# The band is intersected with the model's own trained coeff_clip [lo_c, hi_c]
-# so it can never widen beyond what the regressor was actually trained on.
-REALISTIC_COEFF_MIN = 1.20
-REALISTIC_COEFF_MAX = 1.80
-
-# Above REALISTIC_COEFF_MAX, the classifier is extrapolating into territory
-# with few or no comparable accepted quotes -- it should not be trusted to
-# confidently predict acceptance there. This decays the predicted
-# acceptance probability to 0 as the candidate price's coeff (prix/coût)
-# rises from ACCEPTANCE_DECAY_START to ACCEPTANCE_DECAY_ZERO, instead of
-# letting the model extrapolate an unrealistically high P(accept) for
-# unrealistically high prices.
+# ---------------------------------------------------------------------
+# ACCEPTANCE PROBABILITY DECAY (business rule, not learned by the model)
+# ---------------------------------------------------------------------
+# Above a certain prix/coût coefficient, an offer is considered unrealistic
+# regardless of what the classifier predicts. P(accept) decays linearly
+# from the raw classifier output down to 0 as coeff rises from
+# ACCEPTANCE_DECAY_START to ACCEPTANCE_DECAY_ZERO, and is hard-zeroed above
+# ACCEPTANCE_DECAY_ZERO. This is applied as a post-prediction multiplier in
+# _predict_acceptance_batch and never changes what the classifier itself
+# learned.
 ACCEPTANCE_DECAY_START = 1.80
 ACCEPTANCE_DECAY_ZERO = 2.50
 
@@ -277,28 +269,17 @@ class QuoteEstimator:
             format_dims=format_dims,
             fournisseur=fournisseur,
         )
-        proba = np.clip(base_proba * proba_mult, 0.0, 0.9999)
 
-        # Unrealistic-price decay: compute coeff = prix_total / cout_total
-        # from the raw (pre-log) row values and force P(accept) toward 0 as
-        # the candidate price moves past ACCEPTANCE_DECAY_START toward
-        # ACCEPTANCE_DECAY_ZERO. This stops the classifier from confidently
-        # extrapolating acceptance for prices far outside realistic/trained
-        # territory (e.g. 3-4x cost).
-        cost_raw = pd.to_numeric(rows["cout_total"], errors="coerce").to_numpy()
-        price_raw = pd.to_numeric(rows["prix_total"], errors="coerce").to_numpy()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            coeff_raw = np.where(cost_raw > 0, price_raw / cost_raw, np.nan)
-        span = max(ACCEPTANCE_DECAY_ZERO - ACCEPTANCE_DECAY_START, 1e-6)
-        decay = np.clip(
-            (ACCEPTANCE_DECAY_ZERO - coeff_raw) / span,
-            0.0,
-            1.0,
-        )
-        # Unknown coeff (missing cost/price) -> no decay applied
-        decay = np.where(np.isnan(coeff_raw), 1.0, decay)
+        # Coeff-based decay (see ACCEPTANCE_DECAY_START / _ZERO at top of file).
+        coeff = (
+            pd.to_numeric(rows["prix_total"], errors="coerce")
+            / pd.to_numeric(rows["cout_total"], errors="coerce").replace(0, np.nan)
+        ).to_numpy(dtype=float)
+        span = ACCEPTANCE_DECAY_ZERO - ACCEPTANCE_DECAY_START
+        decay_frac = np.clip((coeff - ACCEPTANCE_DECAY_START) / span, 0.0, 1.0)
+        decay_mult = np.where(np.isnan(coeff), 1.0, 1.0 - decay_frac)
 
-        return np.clip(proba * decay, 0.0, 0.9999)
+        return np.clip(base_proba * proba_mult * decay_mult, 0.0, 0.9999)
 
     def predict_acceptance_proba(
         self,
@@ -369,7 +350,7 @@ class QuoteEstimator:
         source: str,
         *,
         cout_total: float | None = None,
-        pricing_mode: str = "expected_margin",
+        pricing_mode: str = "balanced",
         saison: str | None = None,
         matiere: str | None = None,
         format_dims: str | None = None,
@@ -392,10 +373,9 @@ class QuoteEstimator:
             history and full expected-margin aggression.
         "regressor"
             prix = predicted coefficient × cost (historical median).
-        "expected_margin" (default / only mode exposed in the UI)
-            maximises P(accept)×(prix−coût) within a realistic coefficient
-            band [REALISTIC_COEFF_MIN, REALISTIC_COEFF_MAX] = [1.20, 1.80],
-            intersected with the model's trained coeff_clip.
+        "expected_margin"
+            maximises P(accept)×(prix−coût) up to the trained coeff_clip
+            (tends highest).
         """
         source = source.strip().lower()
         mode = (pricing_mode or "balanced").strip().lower()
@@ -464,16 +444,6 @@ class QuoteEstimator:
         )
         lo_c, hi_c = bundle.get("coeff_clip") or [0.80, 4.00]
         lo_c, hi_c = float(lo_c), float(hi_c)
-        # Hard business floor/ceiling: intersect the trained clip with the
-        # realistic margin band. This makes every mode's decoded coefficient
-        # (median, lower, upper) mechanically fall inside [1.20, 1.80],
-        # regardless of what the regressor itself predicted.
-        lo_c = max(lo_c, REALISTIC_COEFF_MIN)
-        hi_c = min(hi_c, REALISTIC_COEFF_MAX)
-        if hi_c <= lo_c:
-            # Degenerate/very narrow trained clip: fall back to the
-            # realistic band itself.
-            lo_c, hi_c = REALISTIC_COEFF_MIN, REALISTIC_COEFF_MAX
         transform = bundle.get("target_transform", "identity")
         blend = float(bundle.get("small_n_blend") or 0.0)
 
@@ -548,12 +518,9 @@ class QuoteEstimator:
             )
 
         if mode == "expected_margin":
-            # lo_c / hi_c are already the realistic band [1.20, 1.80]
-            # (intersected with the trained clip above), so the grid search
-            # for max P(accept) x margin naturally stays inside it.
             try:
                 median, best_proba, best_score = _grid_pick(
-                    cost * lo_c,
+                    cost * max(lo_c, 1.02),
                     cost * hi_c * price_mult,
                     n=12,
                 )
@@ -1032,7 +999,7 @@ class QuoteEstimator:
         source: str,
         *,
         cout_total: float,
-        pricing_mode: str = "expected_margin",
+        pricing_mode: str = "balanced",
         low_acceptance_percentile: float = 25.0,
         max_discount_pct: float = 0.40,
         min_discount_pct: float = 0.15,
