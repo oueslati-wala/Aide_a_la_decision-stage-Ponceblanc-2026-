@@ -76,6 +76,10 @@ Règles strictes :
 - Tu peux remplir ou modifier les champs du formulaire de la page
   (client, produit, quantité, coûts) via l'outil update_form_inputs quand
   l'utilisateur te le demande ou te donne ces infos pour un devis.
+- Tu as accès à la saisonnalité de l'historique (outil get_seasonality_stats) :
+  volume de devis par mois, par saison (blocs de 4 mois : jan–avr / mai–aoû /
+  sep–déc) et par année. Utilise-le pour toute question sur les périodes,
+  mois ou saisons les plus actives.
 - Tu ne modifies rien d'autre (pas d'écriture dans Odoo, pas de fichier).
 """
 
@@ -382,6 +386,149 @@ def _tool_top_entities(args: dict) -> dict:
     }
 
 
+_MONTH_LABELS_FR = {
+    1: "janvier",
+    2: "février",
+    3: "mars",
+    4: "avril",
+    5: "mai",
+    6: "juin",
+    7: "juillet",
+    8: "août",
+    9: "septembre",
+    10: "octobre",
+    11: "novembre",
+    12: "décembre",
+}
+
+_SEASON_LABELS_FR = {
+    1: "hiver–printemps (jan–avr)",
+    2: "printemps–été (mai–aoû)",
+    3: "automne–hiver (sep–déc)",
+}
+
+
+def _tool_seasonality_stats(args: dict) -> dict:
+    """Volume of quotes by month and by 4-month season (same as model features)."""
+    source = str(args["source"]).lower()
+    client = str(args.get("client") or "").strip()
+    produit_raw = args.get("produit")
+    year_filter = args.get("year")
+    only_signed = bool(args.get("only_signed", False))
+
+    try:
+        df = _get_history(source)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+
+    if df.empty:
+        return {"error": f"Pas d'historique pour {source}."}
+
+    sub = df.copy()
+    if client:
+        client_s = sub["client"].astype(str).str.upper()
+        c = client.upper()
+        mask = client_s == c
+        if not mask.any():
+            mask = client_s.str.contains(c, na=False)
+        sub = sub.loc[mask]
+    if produit_raw:
+        produit = str(features.normalize_produit(str(produit_raw))).upper()
+        prod_s = sub["produit"].astype(str).str.upper()
+        mask_p = prod_s == produit
+        if not mask_p.any():
+            mask_p = prod_s.str.contains(produit, na=False)
+        sub = sub.loc[mask_p]
+    if year_filter is not None:
+        try:
+            y = int(float(year_filter))
+            sub = sub.loc[pd.to_numeric(sub["year"], errors="coerce") == y]
+        except (TypeError, ValueError):
+            pass
+    if only_signed and "signe" in sub.columns:
+        sub = sub.loc[sub["signe"] == 1]
+
+    if sub.empty:
+        return {
+            "n_devis_avec_date": 0,
+            "message": "Aucun devis trouvé avec ces filtres.",
+        }
+
+    month = pd.to_numeric(sub["month"], errors="coerce")
+    year = pd.to_numeric(sub["year"], errors="coerce") if "year" in sub.columns else pd.Series(np.nan, index=sub.index)
+    known = month.notna()
+    sub = sub.loc[known]
+    month = month.loc[known].astype(int).clip(1, 12)
+    year = year.loc[known]
+
+    if sub.empty:
+        return {
+            "n_devis_avec_date": 0,
+            "message": "Aucun devis avec mois renseigné pour ces filtres.",
+        }
+
+    n = int(len(sub))
+    month_counts = month.value_counts().sort_index()
+    par_mois = []
+    for m in range(1, 13):
+        c = int(month_counts.get(m, 0))
+        par_mois.append(
+            {
+                "mois": m,
+                "label": _MONTH_LABELS_FR[m],
+                "n_devis": c,
+                "part_pct": round(100 * c / n, 1) if n else 0.0,
+            }
+        )
+
+    # Same 4-month blocks as features.py season_4m
+    season = ((month - 1) // 4 + 1).clip(1, 3)
+    season_counts = season.value_counts().sort_index()
+    par_saison = []
+    for s in (1, 2, 3):
+        c = int(season_counts.get(s, 0))
+        par_saison.append(
+            {
+                "saison": s,
+                "label": _SEASON_LABELS_FR[s],
+                "n_devis": c,
+                "part_pct": round(100 * c / n, 1) if n else 0.0,
+            }
+        )
+
+    # Peak month / season
+    peak_month = max(par_mois, key=lambda r: r["n_devis"])
+    peak_season = max(par_saison, key=lambda r: r["n_devis"])
+
+    years_available = sorted({int(y) for y in year.dropna().tolist()})
+    par_annee = []
+    if year.notna().any():
+        yc = year.dropna().astype(int).value_counts().sort_index()
+        for y, c in yc.items():
+            par_annee.append({"annee": int(y), "n_devis": int(c)})
+
+    return {
+        "source": source,
+        "filtres": {
+            "client": client or None,
+            "produit": str(produit_raw) if produit_raw else None,
+            "year": int(year_filter) if year_filter is not None else None,
+            "only_signed": only_signed,
+        },
+        "n_devis_avec_date": n,
+        "annees_disponibles": years_available,
+        "par_mois": par_mois,
+        "par_saison_4mois": par_saison,
+        "par_annee": par_annee,
+        "mois_le_plus_actif": peak_month,
+        "saison_la_plus_active": peak_season,
+        "definition_saisons": (
+            "Saisons = blocs de 4 mois alignés sur le modèle : "
+            "1 = jan–avr, 2 = mai–aoû, 3 = sep–déc."
+        ),
+    }
+
+
 TOOL_IMPLS = {
     "get_price_recommendation": _tool_price_recommendation,
     "get_acceptance_probability": _tool_acceptance_probability,
@@ -389,6 +536,7 @@ TOOL_IMPLS = {
     "get_client_acceptance_rate": _tool_client_acceptance_rate,
     "update_form_inputs": _tool_update_form_inputs,
     "get_top_entities": _tool_top_entities,
+    "get_seasonality_stats": _tool_seasonality_stats,
 }
 
 
@@ -583,6 +731,48 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_seasonality_stats",
+            "description": (
+                "Statistiques temporelles sur l'historique des devis : volume "
+                "par mois, par saison (blocs de 4 mois), et par année. "
+                "Utilise ceci pour 'quelle saison a le plus d'offres', "
+                "'mois le plus actif', 'saisonnalité', 'quand y a-t-il le "
+                "plus de devis', 'répartition mensuelle', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["ponceblanc", "lbfi"],
+                    },
+                    "client": {
+                        "type": "string",
+                        "description": "Filtre optionnel sur un client.",
+                    },
+                    "produit": {
+                        "type": "string",
+                        "description": "Filtre optionnel sur un produit.",
+                    },
+                    "year": {
+                        "type": "number",
+                        "description": "Filtre optionnel sur une année (ex. 2024).",
+                    },
+                    "only_signed": {
+                        "type": "boolean",
+                        "description": (
+                            "Si true, ne compte que les devis acceptés/signés. "
+                            "Défaut false = tous les devis."
+                        ),
+                    },
+                },
+                "required": ["source"],
+            },
+        },
+    },
 ]
 
 
@@ -593,7 +783,12 @@ TOOLS = [
 def _get_client_sdk():
     """Lazy import so this module doesn't hard-fail if `openai` isn't
     installed until someone actually opens the chat page."""
-    from openai import OpenAI
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "Module openai manquant. Installez-le avec : pip install openai"
+        ) from exc
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
