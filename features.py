@@ -12,6 +12,7 @@ Final model feature set
     - cout_total      (achat + fabrication + transport, €)
     - season          (4-month blocks: Jan–Apr / May–Aug / Sep–Dec)
     - prix_total      (classifier only: candidate selling price)
+    - prix_unitaire   (classifier only: log1p(prix_total / quantite))
 
 Explicitly excluded
 -------------------
@@ -61,7 +62,6 @@ UNIFIED_COLUMNS = [
     "devis_code",
     "source",
     "client",
-    "reference_client",
     "produit",
     "quantite",
     "taux_marge",
@@ -186,24 +186,6 @@ def _find_col(
         f"Expected header containing {must_contain!r}. "
         f"Actual columns: {list(columns)}"
     )
-
-
-def _find_col_optional(
-    columns,
-    must_contain: list[str],
-):
-    """Same matching as _find_col, but returns None instead of raising when
-    no header matches -- used for fields that may not exist in every raw
-    extract (e.g. a source-specific column) without breaking the pipeline."""
-
-    for column in columns:
-
-        low = str(column).strip().lower()
-
-        if all(part in low for part in must_contain):
-            return column
-
-    return None
 
 
 def _find_sheet_name(
@@ -441,16 +423,32 @@ def _normalize_format(series: pd.Series) -> pd.Series:
 
 
 def _excel_serial_to_month_year(series: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Handle Excel serial dates or already-parsed datetimes."""
-    # Try datetime first
-    dt = pd.to_datetime(series, errors="coerce", dayfirst=True, format="mixed")
+    """Handle Excel serial dates or already-parsed datetimes.
+
+    IMPORTANT: numeric Excel serials must be detected and converted BEFORE
+    pd.to_datetime() ever sees them. If a numeric column is passed straight
+    to pd.to_datetime(), pandas silently interprets those numbers as
+    nanoseconds-since-epoch instead of raising/NaT, which returns bogus
+    dates near 1970-01-01 (month=1, year=1970) instead of failing loudly.
+    Detecting serials first avoids that trap entirely.
+    """
     # Excel serial numbers (rough range 2000-2035 → ~36526–62000)
     numeric = pd.to_numeric(series, errors="coerce")
-    serial_mask = numeric.notna() & (numeric > 30000) & (numeric < 70000) & dt.isna()
+    serial_mask = numeric.notna() & (numeric > 30000) & (numeric < 70000)
+
+    dt = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+
     if serial_mask.any():
         # Excel epoch 1899-12-30
         origin = pd.Timestamp("1899-12-30")
         dt.loc[serial_mask] = origin + pd.to_timedelta(numeric.loc[serial_mask], unit="D")
+
+    remaining = ~serial_mask
+    if remaining.any():
+        dt.loc[remaining] = pd.to_datetime(
+            series.loc[remaining], errors="coerce", dayfirst=True, format="mixed"
+        )
+
     month = dt.dt.month
     year = dt.dt.year
     return month, year
@@ -495,20 +493,6 @@ def standardize_ponceblanc(
     out["client"] = _clean_text(
         df["Nom Client"]
     )
-
-    ref_client_col = _find_col_optional(
-        df.columns,
-        ["référence", "client"],
-    )
-    if ref_client_col is not None:
-        out["reference_client"] = (
-            df[ref_client_col]
-            .astype(str)
-            .str.strip()
-            .replace({"nan": np.nan, "None": np.nan, "": np.nan})
-        )
-    else:
-        out["reference_client"] = np.nan
 
     out["produit"] = normalize_produit_series(
         _clean_text(df["Type de produit"])
@@ -654,20 +638,6 @@ def standardize_lbfi(
     out["client"] = _clean_text(
         df["Nom Client"]
     )
-
-    ref_client_col = _find_col_optional(
-        df.columns,
-        ["référence", "client"],
-    )
-    if ref_client_col is not None:
-        out["reference_client"] = (
-            df[ref_client_col]
-            .astype(str)
-            .str.strip()
-            .replace({"nan": np.nan, "None": np.nan, "": np.nan})
-        )
-    else:
-        out["reference_client"] = np.nan
 
     out["produit"] = normalize_produit_series(
         _clean_text(df["Type de produit"])
@@ -1109,6 +1079,7 @@ def build_feature_matrix(
     log_cost: bool = False,
     log_price: bool = False,
     include_cost: bool = False,
+    include_unit_price: bool = False,
     # Kept for backward compatibility with older call sites (ignored)
     matiere_encoding: dict | None = None,
     format_encoding: dict | None = None,
@@ -1120,6 +1091,7 @@ def build_feature_matrix(
         client, produit, quantite, cout_total,
         season from date (4-month blocks + month sin/cos)
         + prix_total when include_price (classifier only)
+        + prix_unitaire when include_unit_price (classifier only)
 
     NOT used: matiere, historical delai_jours, format, commercial, dimensions.
     """
@@ -1168,6 +1140,16 @@ def build_feature_matrix(
         if log_price:
             price = np.log1p(price.clip(lower=0))
         X["prix_total"] = price
+
+    # Classifier only — deterministic ratio of prix_total / quantite.
+    # Trees struggle to approximate a per-unit threshold via axis-aligned
+    # splits on the two raw features alone, so this gives that pattern its
+    # own column. Never used by the price regressor (would leak the target).
+    if include_unit_price:
+        qty = pd.to_numeric(df["quantite"], errors="coerce")
+        raw_price = pd.to_numeric(df["prix_total"], errors="coerce")
+        unit_price = raw_price / qty.replace(0, np.nan)
+        X["prix_unitaire"] = np.log1p(unit_price.clip(lower=0))
 
     if include_taux_marge:
         X["taux_marge"] = pd.to_numeric(df["taux_marge"], errors="coerce")

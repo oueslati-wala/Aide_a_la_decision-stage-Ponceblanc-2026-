@@ -5,8 +5,8 @@
   "n_test": 390,
   "acceptance_rate": 0.3521560574948665,
   "classifier": {
-    "accuracy": 0.6692307692307692,
-    "roc_auc": 0.7278930209745824,
+    "accuracy": 0.6897435897435897,
+    "roc_auc": 0.7315859323158593,
     "features": [
       "quantite",
       "produit_cluster",
@@ -17,7 +17,8 @@
       "month_known",
       "season_4m",
       "cout_total",
-      "prix_total"
+      "prix_total",
+      "prix_unitaire"
     ]
   },
   "margin_regressor": {

@@ -34,8 +34,8 @@ from predict import QuoteEstimator
 try:
     from predict import ACCEPTANCE_DECAY_START, ACCEPTANCE_DECAY_ZERO
 except ImportError:
-    ACCEPTANCE_DECAY_START = 3.0
-    ACCEPTANCE_DECAY_ZERO = 5.0
+    ACCEPTANCE_DECAY_START = 1.90
+    ACCEPTANCE_DECAY_ZERO = 2.80
 
 st.set_page_config(page_title="Estimateur d'offres", layout="wide", page_icon="🧾")
 
@@ -255,12 +255,12 @@ def fmt_eur(x: float | int | None, decimals: int = 0) -> str:
 
 
 @st.cache_resource
-def get_estimator(_version: int = 16):
+def get_estimator(_version: int = 24):
     return QuoteEstimator()
 
 
 @st.cache_data
-def get_history(source: str, _version: int = 16) -> pd.DataFrame:
+def get_history(source: str, _version: int = 24) -> pd.DataFrame:
     try:
         df = features.build_source(source)
         if df is None:
@@ -303,21 +303,17 @@ def cached_recommend(
     cout_total: float,
     month: int | None,
     year: int | None,
-    low_acceptance_percentile: float = 25.0,
-    pricing_mode: str = "balanced",
-    _version: int = 23,
+    _version: int = 25,
 ):
     """Cache price recommendation for identical inputs (fast UI).
     month/year may be None when the user disables date/season.
 
-    Uses recommend_price_strategic so that clients in the bottom slice of
-    historical acceptance rates get a deliberately lower margin (higher
-    chance of winning the quote). The percentile defines that slice.
-
-    pricing_mode: "balanced" (default), "regressor", or "expected_margin".
+    Always uses the "balanced" pricing mode (ambitious but realistic —
+    regressor coefficient, nudged up toward P(accept)×margin within the
+    historical p75 band).
     """
     est = get_estimator()
-    rec = est.recommend_price_strategic(
+    rec = est.recommend_price(
         client=client,
         produit=produit,
         quantite=quantite,
@@ -325,10 +321,8 @@ def cached_recommend(
         cout_total=cout_total,
         month=month,
         year=year,
-        low_acceptance_percentile=float(low_acceptance_percentile),
-        pricing_mode=pricing_mode,
+        pricing_mode="balanced",
     )
-    # Prefer the probability already computed on the strategic price when available
     if rec.get("acceptance_probability") is not None:
         proba = float(rec["acceptance_probability"])
     else:
@@ -357,16 +351,6 @@ def clean_dropdown_values(
     values = values[values.str.lower() != "nan"]
 
     return sorted(values.unique().tolist())
-
-
-def smooth_curve(curve: pd.DataFrame, window: int = 5) -> pd.DataFrame:
-    out = curve.copy()
-    out["acceptance_proba_smooth"] = (
-        out["acceptance_proba"]
-        .rolling(window=window, center=True, min_periods=1)
-        .mean()
-    )
-    return out
 
 
 def compute_margin(prix_total: float | None, cout_total: float | None) -> dict:
@@ -762,7 +746,6 @@ if page == "Aide à la décision":
         pression_concurrentielle = None
         marge_cible = None
         delai_livraison = None
-        prix_candidat = None
 
     if use_season:
         st.caption(
@@ -776,83 +759,16 @@ if page == "Aide à la décision":
             "**Date / saison ignorées** pour cette estimation."
         )
 
-    with st.expander("Filtres pour l'historique comparable (n'entraînent pas le modèle)"):
-        f1, f2, f3 = st.columns(3)
-        with f1:
-            qty_band = st.slider(
-                "Tolérance quantité pour « similaire »",
-                min_value=0.1,
-                max_value=1.0,
-                value=0.5,
-                step=0.1,
-            )
-        with f2:
-            only_accepted = st.checkbox("Historique : acceptés seulement", value=False)
-        with f3:
-            min_n_hint = st.number_input(
-                "Seuil d'alerte N similaires",
-                min_value=1,
-                value=10,
-            )
+    # Fixed defaults for the "similar history" comparison (no longer
+    # exposed as UI controls — was testing/tuning surface).
+    qty_band = 0.5
+    only_accepted = False
+    min_n_hint = 10
 
-    with st.expander(
-        "Stratégie clients à faible acceptation (ajuste la marge recommandée)",
-        expanded=False,
-    ):
-        st.markdown(
-            "Pour les clients dont le **taux d'acceptation historique** est parmi "
-            "les plus bas de la source, le système **force une marge plus basse** "
-            "(remise de 15 % à 40 % selon la sévérité) afin d'augmenter la chance "
-            "de gagner le devis. C'est une **décision de portefeuille**, pas un "
-            "apprentissage du modèle : on accepte moins de marge sur ce devis pour "
-            "mieux convertir le client, en misant sur le reste du portefeuille."
-        )
-        low_acc_pct = st.slider(
-            "Seuil « faible acceptation » (percentile)",
-            min_value=5,
-            max_value=50,
-            value=25,
-            step=5,
-            key=f"low_acc_pct_{source}",
-            help=(
-                "Ex. 25 = les 25 % de clients avec le taux d'acceptation le plus bas "
-                "sont considérés « faibles ». Plus le curseur est haut, plus de clients "
-                "reçoivent une marge réduite. Plus il est bas, seule une minorité "
-                "très difficile est ciblée."
-            ),
-        )
-        st.caption(
-            f"Les clients dans le **bas {int(low_acc_pct)} %** des taux d'acceptation "
-            "lissés de cette source reçoivent une **remise forcée** sur le prix "
-            "recommandé : **15 % minimum**, jusqu'à **40 %** pour les clients les "
-            "plus difficiles (proportionnelle à l'écart au seuil). "
-            "Le prix ne descend jamais sous coût × 1,05. "
-            "Les scénarios ajoutent alors une ligne **Acquisition (marge mini ≈ +10 %)**."
-        )
-
-    pricing_mode_label = st.radio(
-        "Mode de pricing",
-        [
-            "Équilibré (ambitieux réaliste)",
-            "Régressor (marge historique)",
-            "Marge espérée (P × marge)",
-        ],
-        index=0,
-        horizontal=True,
-        key=f"pricing_mode_{source}",
-        help=(
-            "Équilibré (défaut) : part du coeff historique, puis monte un peu "
-            "(jusqu'à +15 % / p75 des acceptés) si la proba le permet. "
-            "Régressor : strictement le coeff prédit (médiane ≈ 1,37 PB / 1,15 LBFI). "
-            "Marge espérée : maximise P×marge jusqu'au clip du modèle (le plus haut)."
-        ),
-    )
-    if pricing_mode_label.startswith("Équilibré"):
-        pricing_mode = "balanced"
-    elif pricing_mode_label.startswith("Régressor"):
-        pricing_mode = "regressor"
-    else:
-        pricing_mode = "expected_margin"
+    # Pricing mode: always "balanced" (regressor coefficient, nudged up
+    # toward P(accept)×margin within the historical p75 band). The
+    # "regressor" and "expected_margin" alternatives exist in predict.py
+    # for experimentation but are not exposed in the UI.
 
     similar = filter_similar(history, client, produit, quantite, qty_tol=float(qty_band))
 
@@ -882,16 +798,8 @@ if page == "Aide à la décision":
             cout_total=float(cout_total),
             month=int(month) if month is not None else None,
             year=int(year) if year is not None else None,
-            low_acceptance_percentile=float(low_acc_pct),
-            pricing_mode=pricing_mode,
         )
         prix_recommande = float(rec["prix_median"])
-        strategic_applied = bool(rec.get("strategic_pricing_applied"))
-        client_acc_rate = rec.get("client_acceptance_rate")
-        low_acc_threshold = rec.get("low_acceptance_threshold")
-        strategic_baseline = rec.get("strategic_baseline_price")
-        strategic_discount = rec.get("strategic_discount_pct")
-        strategic_target = rec.get("strategic_target_proba")
 
         prix_unitaire_reco = (
             prix_recommande / float(quantite) if quantite and float(quantite) > 0 else 0.0
@@ -906,48 +814,29 @@ if page == "Aide à la décision":
                 f"{prix_unitaire_reco:,.4f} €".replace(",", " "),
                 help="Prix total recommandé ÷ quantité",
             )
-            coeff_help = "prix / coût (ex. 1.30 = +30 % sur le coût)"
-            if strategic_applied:
-                coeff_help += (
-                    " — Marge volontairement abaissée (stratégie client à faible acceptation)."
-                )
             m3.metric(
                 "Coefficient de marge",
                 fmt_coefficient(marge_reco["coefficient"]),
-                help=coeff_help,
+                help="prix / coût (ex. 1.30 = +30 % sur le coût)",
             )
             m4.metric("P(acceptation)", f"{proba_reco:.0%}", help=interpret_proba(proba_reco))
             m5, m6 = st.columns(2)
             m5.metric("Coût total", fmt_eur(cout_total))
-            marge_delta = fmt_pct_signed(marge_reco["taux_pct"])
-            if strategic_applied and strategic_discount is not None:
-                marge_delta = f"stratégie −{strategic_discount:.0%}"
             m6.metric(
                 "Marge (€)",
                 fmt_eur(marge_reco["marge_eur"]),
-                delta=marge_delta,
+                delta=fmt_pct_signed(marge_reco["taux_pct"]),
             )
 
-            mode_txt = {
-                "balanced": "mode équilibré (ambitieux réaliste)",
-                "regressor": "mode régressor (coeff historique)",
-                "expected_margin": "mode marge espérée (P × marge)",
-            }.get(pricing_mode, f"mode {pricing_mode}")
             st.success(
                 f"{probability_label(proba_reco)} — Prix recommandé : "
                 f"**{fmt_eur(prix_recommande)}** "
                 f"({prix_unitaire_reco:,.4f} € / exemplaire)".replace(",", " ")
             )
-            if strategic_applied:
-                st.caption(
-                    f"{mode_txt.capitalize()} · marge abaissée (client à faible acceptation). "
-                    f"Intervalle : {fmt_eur(rec['prix_lower'])} — {fmt_eur(rec['prix_upper'])}."
-                )
-            else:
-                st.caption(
-                    f"{mode_txt.capitalize()} · "
-                    f"Intervalle : {fmt_eur(rec['prix_lower'])} — {fmt_eur(rec['prix_upper'])}."
-                )
+            st.caption(
+                f"Mode équilibré (ambitieux réaliste) · "
+                f"Intervalle : {fmt_eur(rec['prix_lower'])} — {fmt_eur(rec['prix_upper'])}."
+            )
 
     except (ValueError, FileNotFoundError) as exc:
         st.error(str(exc))
@@ -1012,43 +901,6 @@ Entrées **uniquement** :
 - P(acceptation) : **{proba_reco:.0%}**
 - Intervalle : **{fmt_eur(rec['prix_lower'])} — {fmt_eur(rec['prix_upper'])}**
 """
-        )
-
-    # Explicit explanation when margin was lowered for a low-acceptance client
-    if strategic_applied:
-        rate_txt = (
-            f"{client_acc_rate:.0%}" if client_acc_rate is not None else "n/a"
-        )
-        thr_txt = (
-            f"{low_acc_threshold:.0%}" if low_acc_threshold is not None else "n/a"
-        )
-        base_txt = (
-            fmt_eur(strategic_baseline) if strategic_baseline is not None else "n/a"
-        )
-        disc_txt = (
-            f"{strategic_discount:.0%}" if strategic_discount is not None else "n/a"
-        )
-        st.info(
-            f"**Pourquoi la marge est plus basse sur ce devis** — "
-            f"le client **{client_key}** a un taux d'acceptation historique lissé "
-            f"d'environ **{rate_txt}**. Avec le seuil que vous avez choisi "
-            f"(percentile **{int(low_acc_pct)}** → seuil ≈ **{thr_txt}**), "
-            f"il est classé parmi les clients à **faible acceptation**. "
-            f"Le prix a donc été volontairement abaissé par rapport au prix "
-            f"« normal » du modèle (**{base_txt}** → **{fmt_eur(prix_recommande)}**, "
-            f"remise ≈ **{disc_txt}**). "
-            f"Plus le taux d'acceptation du client est bas, plus la remise est "
-            f"forte (15 % minimum → jusqu'à 40 % pour les clients les plus difficiles). "
-            f"Objectif : gagner ce devis en acceptant une marge plus faible ici, "
-            f"en misant sur le reste du portefeuille. "
-            f"Vous pouvez modifier le seuil « faible acceptation » dans l'encart "
-            f"ci-dessus pour décider qui est concerné par cette stratégie."
-        )
-    elif client_acc_rate is not None and low_acc_threshold is not None:
-        st.caption(
-            f"Client **{client_key}** : taux d'acceptation lissé ≈ **{client_acc_rate:.0%}** "
-            f"(seuil « faible » actuel ≈ **{low_acc_threshold:.0%}**, percentile "
-            f"**{int(low_acc_pct)}**). Pas de baisse stratégique de marge sur ce devis."
         )
 
     # Historical proof
@@ -1206,27 +1058,18 @@ Entrées **uniquement** :
     # Fast scenarios: one batched grid, no nested max_* loops
     max_acc = None
     ambitieux_price = round(prix_recommande * 1.10, -1)
-    # For low-acceptance clients, densify the low-coeff end of the grid so
-    # "Meilleure P" and acquisition scenarios can land near cost.
     try:
-        if strategic_applied:
-            # denser sampling between cost×1.05 and the strategic price
-            low_end = np.linspace(float(cout_total) * 1.05, float(prix_recommande), 10)
-            high_end = np.linspace(float(prix_recommande), float(min(cout_total * min(MAX_COEFF, 3.0), prix_recommande * 2.0, 500_000.0)), 8)
-            grid_prices = np.unique(np.concatenate([low_end, high_end]))
-        else:
-            grid_min = float(cout_total)
-            grid_max = float(min(cout_total * min(MAX_COEFF, 3.0), max(prix_recommande * 2.0, cout_total * 1.5), 500_000.0))
-            grid_prices = np.linspace(grid_min, grid_max, 16)
-        rows_grid = []
-        for gp in grid_prices:
-            rows_grid.append(
-                est._make_row(
-                    client, produit, quantite, source,
-                    cout_total=cout_total, prix_total=float(gp),
-                    matiere=matiere, month=month, year=year,
-                )
+        grid_min = float(cout_total)
+        grid_max = float(min(cout_total * min(MAX_COEFF, 3.0), max(prix_recommande * 2.0, cout_total * 1.5), 500_000.0))
+        grid_prices = np.linspace(grid_min, grid_max, 16)
+        rows_grid = [
+            est._make_row(
+                client, produit, quantite, source,
+                cout_total=cout_total, prix_total=float(gp),
+                matiere=matiere, month=month, year=year,
             )
+            for gp in grid_prices
+        ]
         grid_df = pd.concat(rows_grid, ignore_index=True)
         grid_probs = est._predict_acceptance_batch(grid_df, source, matiere=matiere)
         # max acceptance
@@ -1245,38 +1088,18 @@ Entrées **uniquement** :
     except Exception as exc:
         st.warning(f"Scénarios optimisés indisponibles : {exc}")
 
-    if strategic_applied:
-        st.caption(
-            "**Recommandé** = prix modèle **déjà abaissé** (stratégie client faible acceptation). "
-            "**Acquisition** = marge minimale (≈ coût × 1,10) pour tenter de gagner le devis. "
-            "**Meilleure P(accept)** = prix qui maximise la proba sur une grille densifiée côté bas."
-        )
-    else:
-        st.caption(
-            "**Recommandé** = prix typique accepté (régresseur + grille). "
-            "**Ambitieux** = prix le plus haut dont la P(accept) reste ≥ celle du recommandé "
-            f"({proba_reco:.0%}). "
-            "**Meilleure P(accept)** = prix qui maximise la proba."
-        )
+    st.caption(
+        "**Recommandé** = prix typique accepté (régresseur + grille). "
+        "**Ambitieux** = prix le plus haut dont la P(accept) reste ≥ celle du recommandé "
+        f"({proba_reco:.0%}). "
+        "**Meilleure P(accept)** = prix qui maximise la proba."
+    )
 
-    # Acquisition floor: ~10% above cost — only shown for low-acceptance clients
-    acquisition_price = max(float(cout_total) * 1.10, float(cout_total) + 1.0)
-
-    if strategic_applied:
-        # More aggressive anchors when the client is hard to win
-        prudent_price = max(acquisition_price, round(float(prix_recommande) * 0.85, -1))
-        anchor_prices = {
-            "Acquisition (marge mini)": round(acquisition_price, -1) if acquisition_price >= 100 else round(acquisition_price, 0),
-            "Prudent (viser l'acceptation)": prudent_price,
-            "Recommandé (stratégie)": prix_recommande,
-            "Ambitieux (plus élevé)": ambitieux_price,
-        }
-    else:
-        anchor_prices = {
-            "Prudent (viser l'acceptation)": max(cout_total, round(prix_recommande * 0.90, -1)),
-            "Recommandé (modèle)": prix_recommande,
-            "Ambitieux (plus élevé)": ambitieux_price,
-        }
+    anchor_prices = {
+        "Prudent (viser l'acceptation)": max(cout_total, round(prix_recommande * 0.90, -1)),
+        "Recommandé (modèle)": prix_recommande,
+        "Ambitieux (plus élevé)": ambitieux_price,
+    }
     if max_acc is not None:
         anchor_prices[
             f"Meilleure P(accept) ({max_acc['proba']:.0%})"
@@ -1387,67 +1210,66 @@ Entrées **uniquement** :
 
     # Sensibilité — only compute when expander is open (saves a full grid on every tweak)
     st.subheader("6. Sensibilité")
-    with st.expander("Afficher la courbe P(acceptation) vs prix", expanded=False):
+    with st.expander("Afficher les courbes P(acceptation) vs quantité et vs prix", expanded=False):
         st.caption(
             f"Coût fixé à **{fmt_eur(cout_total)}**. "
-            "Vous pouvez monter très haut pour tester l’effet sur P(acceptation) "
-            "(prédictions du classifieur, pas un taux empirique)."
+            "Prédictions du classifieur (pas un taux empirique)."
         )
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            step_val = st.number_input(
-                "Pas (€)", min_value=5.0, value=100.0, step=10.0,
-                key=f"step_sens_{source}",
-            )
-        with c2:
-            sens_max_coeff = st.number_input(
-                "Coeff max (× coût)",
-                min_value=1.2,
-                max_value=10.0,
-                value=4.0,
-                step=0.5,
-                key=f"sens_max_coeff_{source}",
-                help="Plafond de la courbe = coût × ce coefficient (ex. 4.0 = +300 % sur le coût).",
-            )
-        with c3:
-            sens_min_coeff = st.number_input(
-                "Coeff min (× coût)",
-                min_value=1.0,
-                max_value=3.0,
-                value=1.05,
-                step=0.05,
-                key=f"sens_min_coeff_{source}",
-            )
-
-        st.markdown("**Sensibilité à la quantité**")
-        cq1, cq2 = st.columns(2)
-        with cq1:
-            qty_test_price = st.number_input(
-                "Prix à tester pour la courbe quantité (€)",
-                min_value=0.0,
-                value=round(float(prix_recommande), 2),
-                step=50.0,
-                key=f"qty_sens_price_{source}",
-                help=(
-                    "La courbe quantité fixe ce prix et fait varier la quantité. "
-                    "Changez ce prix pour voir comment la sensibilité à la "
-                    "quantité se déforme selon le niveau de prix testé."
-                ),
-            )
-        with cq2:
-            qty_max_mult = st.number_input(
-                "Quantité max testée (× quantité actuelle)",
-                min_value=1.2,
-                max_value=10.0,
-                value=3.0,
-                step=0.5,
-                key=f"qty_sens_max_{source}",
-            )
+        # Default ceiling ≈ historical p90 (+ a bit of headroom), not the
+        # outlier clip — keeps the chart in the commercially relevant band.
+        _default_max_coeff = 2.2 if source == "ponceblanc" else 1.6
+        sens_min_price = float(cout_total) * 1.05
+        sens_max_price = min(float(cout_total) * _default_max_coeff, 500_000.0)
+        step_val = max(5.0, (sens_max_price - sens_min_price) / 60.0)
 
         try:
-            sens_min_price = float(cout_total) * float(sens_min_coeff)
-            sens_max_price = float(cout_total) * float(sens_max_coeff)
-            sens_max_price = min(sens_max_price, 500_000.0)
+            # --- Quantity curve (price fixed at the recommended price) ---
+            qty_min = max(1.0, float(quantite) * 0.2)
+            qty_max = max(qty_min * 1.05, float(quantite) * 3.0)
+            qty_grid = np.linspace(qty_min, qty_max, 20)
+            qty_rows = [
+                est._make_row(
+                    client, produit, float(q), source,
+                    cout_total=cout_total, prix_total=float(prix_recommande),
+                    matiere=matiere, month=month, year=year,
+                )
+                for q in qty_grid
+            ]
+            qty_probs = est._predict_acceptance_batch(
+                pd.concat(qty_rows, ignore_index=True), source, matiere=matiere,
+            )
+            qty_curve = pd.DataFrame({"quantite": qty_grid, "acceptance_proba": qty_probs})
+
+            qty_tooltip = [
+                alt.Tooltip("quantite:Q", title="Quantité", format=",.0f"),
+                alt.Tooltip("acceptance_proba:Q", title="P(accept)", format=".0%"),
+            ]
+            qty_line = (
+                alt.Chart(qty_curve)
+                .mark_line(color="#64735A", strokeWidth=2.5)
+                .encode(
+                    x=alt.X(
+                        "quantite:Q",
+                        title=f"Quantité (prix fixé à {fmt_eur(prix_recommande)})",
+                        axis=alt.Axis(format=",.0f", tickCount=6, titleColor="#2B241C", labelColor="#746553", grid=True, gridOpacity=0.2),
+                    ),
+                    y=alt.Y(
+                        "acceptance_proba:Q",
+                        title="P(acceptation)",
+                        scale=alt.Scale(domain=[0, 1]),
+                        axis=alt.Axis(format="%", titleColor="#2B241C", labelColor="#746553", tickCount=6),
+                    ),
+                    tooltip=qty_tooltip,
+                )
+            )
+            qty_pts = qty_line.mark_circle(size=80, opacity=0.01)
+            st.altair_chart(alt.layer(qty_line, qty_pts).properties(height=300), use_container_width=True)
+            st.caption(
+                f"Quantité testée : {qty_min:,.0f} → {qty_max:,.0f} · prix fixé à la recommandation."
+                .replace(",", " ")
+            )
+
+            # --- Price curve (quantity fixed at current input) ---
             curve = est.optimize_price(
                 client=client,
                 produit=produit,
@@ -1463,173 +1285,74 @@ Entrées **uniquement** :
             )
             curve = curve.copy()
             curve["coeff"] = curve["prix_total"] / float(cout_total)
-            curve["courbe"] = "Prix"
-
-            # Quantity sensitivity, held price fixed at qty_test_price.
-            qty_min = max(1.0, float(quantite) * 0.2)
-            qty_max = max(qty_min * 1.05, float(quantite) * float(qty_max_mult))
-            qty_grid = np.linspace(qty_min, qty_max, 20)
-            qty_rows = [
-                est._make_row(
-                    client, produit, float(q), source,
-                    cout_total=cout_total, prix_total=float(qty_test_price),
-                    matiere=matiere, month=month, year=year,
-                )
-                for q in qty_grid
-            ]
-            qty_probs = est._predict_acceptance_batch(
-                pd.concat(qty_rows, ignore_index=True), source, matiere=matiere,
+            curve["prix_unitaire"] = (
+                curve["prix_total"] / float(quantite) if quantite else np.nan
             )
-            qty_curve = pd.DataFrame({
-                "quantite": qty_grid,
-                "acceptance_proba": qty_probs,
-                "courbe": "Quantité",
-                "prix_fixe": float(qty_test_price),
-            })
 
             # Divider: start of the artificial "unrealistic" decay zone
-            # (see ACCEPTANCE_DECAY_START in predict.py).
-            divider_price = float(cout_total) * ACCEPTANCE_DECAY_START
-            zero_price = float(cout_total) * ACCEPTANCE_DECAY_ZERO
+            # (source-aware via est._decay_bounds when available).
+            try:
+                _d_start, _d_zero = est._decay_bounds(source)
+            except Exception:
+                _d_start, _d_zero = ACCEPTANCE_DECAY_START, ACCEPTANCE_DECAY_ZERO
+            divider_price = float(cout_total) * float(_d_start)
             show_divider = sens_min_price <= divider_price <= sens_max_price
 
-            # Dual x-axis: price on bottom (terracotta), quantity on top (sage).
-            # Explicit scale domains + resolve_axis keep BOTH number sets visible.
-            y_shared = alt.Y(
-                "acceptance_proba:Q",
-                title="P(acceptation)",
-                scale=alt.Scale(domain=[0, 1]),
-                axis=alt.Axis(
-                    format="%",
-                    titleColor="#2B241C",
-                    labelColor="#746553",
-                    tickCount=6,
-                ),
-            )
-
             price_tooltip = [
-                alt.Tooltip("courbe:N", title="Courbe"),
                 alt.Tooltip("prix_total:Q", title="Prix (€)", format=",.0f"),
+                alt.Tooltip("prix_unitaire:Q", title="€ / exemplaire", format=",.4f"),
                 alt.Tooltip("coeff:Q", title="Coeff", format=".2f"),
                 alt.Tooltip("acceptance_proba:Q", title="P(accept)", format=".0%"),
             ]
-            qty_tooltip = [
-                alt.Tooltip("courbe:N", title="Courbe"),
-                alt.Tooltip("quantite:Q", title="Quantité", format=",.0f"),
-                alt.Tooltip("prix_fixe:Q", title="Prix fixé (€)", format=",.0f"),
-                alt.Tooltip("acceptance_proba:Q", title="P(accept)", format=".0%"),
-            ]
 
-            price_scale = alt.Scale(domain=[float(sens_min_price), float(sens_max_price)])
-            qty_scale = alt.Scale(domain=[float(qty_min), float(qty_max)])
-
-            # Bottom axis = price (terracotta)
             price_line = (
                 alt.Chart(curve)
                 .mark_line(color="#A9552F", strokeWidth=2.5)
                 .encode(
                     x=alt.X(
                         "prix_total:Q",
-                        scale=price_scale,
+                        scale=alt.Scale(domain=[sens_min_price, sens_max_price]),
                         axis=alt.Axis(
                             title="Prix de vente total (€)",
                             format=",.0f",
                             tickCount=6,
-                            titleColor="#A9552F",
-                            labelColor="#A9552F",
-                            tickColor="#A9552F",
-                            domainColor="#A9552F",
+                            titleColor="#2B241C",
+                            labelColor="#746553",
                             grid=True,
                             gridOpacity=0.2,
-                            orient="bottom",
                         ),
                     ),
-                    y=y_shared,
+                    y=alt.Y(
+                        "acceptance_proba:Q",
+                        title="P(acceptation)",
+                        scale=alt.Scale(domain=[0, 1]),
+                        axis=alt.Axis(format="%", titleColor="#2B241C", labelColor="#746553", tickCount=6),
+                    ),
                     tooltip=price_tooltip,
                 )
             )
-            price_pts = (
-                alt.Chart(curve)
-                .mark_circle(size=80, opacity=0.01)
-                .encode(
-                    x=alt.X("prix_total:Q", scale=price_scale, axis=None),
-                    y=y_shared,
-                    tooltip=price_tooltip,
-                )
-            )
+            price_pts = price_line.mark_circle(size=80, opacity=0.01)
 
-            # Top axis = quantity (sage)
-            qty_line = (
-                alt.Chart(qty_curve)
-                .mark_line(color="#64735A", strokeWidth=2.5, strokeDash=[5, 3])
-                .encode(
-                    x=alt.X(
-                        "quantite:Q",
-                        scale=qty_scale,
-                        axis=alt.Axis(
-                            title="Quantité (à prix fixe)",
-                            format=",.0f",
-                            tickCount=6,
-                            titleColor="#64735A",
-                            labelColor="#64735A",
-                            tickColor="#64735A",
-                            domainColor="#64735A",
-                            grid=False,
-                            orient="top",
-                        ),
-                    ),
-                    y=y_shared,
-                    tooltip=qty_tooltip,
-                )
-            )
-            qty_pts = (
-                alt.Chart(qty_curve)
-                .mark_circle(size=80, opacity=0.01)
-                .encode(
-                    x=alt.X("quantite:Q", scale=qty_scale, axis=None),
-                    y=y_shared,
-                    tooltip=qty_tooltip,
-                )
-            )
-
-            layers = [price_line, price_pts, qty_line, qty_pts]
+            layers = [price_line, price_pts]
             if show_divider:
                 divider_df = pd.DataFrame({"prix_total": [divider_price]})
-                divider_rule = (
+                layers.append(
                     alt.Chart(divider_df)
                     .mark_rule(color="#A2483E", strokeWidth=1.5, strokeDash=[6, 4])
-                    .encode(
-                        x=alt.X("prix_total:Q", scale=price_scale, axis=None),
-                    )
+                    .encode(x=alt.X("prix_total:Q", scale=alt.Scale(domain=[sens_min_price, sens_max_price])))
                 )
-                layers.append(divider_rule)
 
-            combined = (
-                alt.layer(*layers)
-                .resolve_scale(x="independent")
-                .resolve_axis(x="independent")
-                .properties(height=400)
-            )
-            st.altair_chart(combined, use_container_width=True)
+            st.altair_chart(alt.layer(*layers).properties(height=300), use_container_width=True)
 
-            legend_bits = [
-                "🟠 **Prix** (axe bas, couleur terracotta) · "
-                "🟢 **Quantité** (axe haut, pointillé sage — prix fixé à "
-                f"{fmt_eur(qty_test_price)})",
-            ]
             if show_divider:
-                legend_bits.append(
+                st.caption(
                     f"🔴 pointillé rouge = début de la zone jugée irréaliste "
-                    f"(coeff ≥ {ACCEPTANCE_DECAY_START:.2f}× ≈ {fmt_eur(divider_price)}) : "
-                    f"P(accept) est artificiellement ramenée à 0 à coeff "
-                    f"{ACCEPTANCE_DECAY_ZERO:.2f}× ({fmt_eur(zero_price)})."
+                    f"(coeff ≥ {_d_start:.2f}× ≈ {fmt_eur(divider_price)}) : "
+                    f"P(accept) est artificiellement ramenée à 0 à coeff {_d_zero:.2f}×."
                 )
-            st.caption(" · ".join(legend_bits))
             st.caption(
                 f"Plage prix : {fmt_eur(sens_min_price)} → {fmt_eur(sens_max_price)} "
-                f"(coeff {float(sens_min_coeff):.2f}× → {float(sens_max_coeff):.2f}×), "
-                f"{len(curve)} points. Plage quantité : {qty_min:,.0f} → {qty_max:,.0f}."
-                .replace(",", " ")
+                f"(coeff 1,05× → {_default_max_coeff:.1f}×), {len(curve)} points."
             )
         except (ValueError, AttributeError) as exc:
             st.error(str(exc))
@@ -2157,6 +1880,7 @@ en s'appuyant sur l'historique des offres acceptées / refusées de la même sou
 | Coût total | achat + fabrication + transport |
 | Date → saison 4 mois | Optionnelle (bascule UI) ; S1 / S2 / S3 si activée |
 | Prix candidat | classifieur uniquement (P(accept)) |
+| Prix unitaire | classifieur uniquement (`prix / quantité`) |
 
 **Non utilisés** : délai offre→décision (ne pilote pas la décision client), format, commercial, heuristiques pression / marge cible.
 

@@ -5,8 +5,8 @@
   "n_test": 1227,
   "acceptance_rate": 0.3094111890393084,
   "classifier": {
-    "accuracy": 0.7408312958435208,
-    "roc_auc": 0.7694820729509724,
+    "accuracy": 0.7416462917685411,
+    "roc_auc": 0.7665895109675014,
     "features": [
       "quantite",
       "produit_cluster",
@@ -17,17 +17,18 @@
       "month_known",
       "season_4m",
       "cout_total",
-      "prix_total"
+      "prix_total",
+      "prix_unitaire"
     ]
   },
   "margin_regressor": {
     "target": "coefficient",
     "mode": "coeff_times_cost",
     "target_transform": "log",
-    "mae": 207.80201917527594,
-    "mae_coeff": 0.07063752126461575,
+    "mae": 218.619955514565,
+    "mae_coeff": 0.07074593245775847,
     "mae_baseline_eur": 285.5211496157202,
-    "within_20pct": 0.9669669669669669,
+    "within_20pct": 0.963963963963964,
     "n_rows": 1665,
     "features": [
       "quantite",

@@ -28,18 +28,13 @@ import features
 
 MODELS_DIR = Path("models")
 
-# ---------------------------------------------------------------------
-# ACCEPTANCE PROBABILITY DECAY (business rule, not learned by the model)
-# ---------------------------------------------------------------------
-# Above a certain prix/coût coefficient, an offer is considered unrealistic
-# regardless of what the classifier predicts. P(accept) decays linearly
-# from the raw classifier output down to 0 as coeff rises from
-# ACCEPTANCE_DECAY_START to ACCEPTANCE_DECAY_ZERO, and is hard-zeroed above
-# ACCEPTANCE_DECAY_ZERO. This is applied as a post-prediction multiplier in
-# _predict_acceptance_batch and never changes what the classifier itself
-# learned.
-ACCEPTANCE_DECAY_START = 1.80
-ACCEPTANCE_DECAY_ZERO = 2.50
+# Soft post-model decay on P(accept) for unrealistic coefficients.
+# Starts after the historical mass (≈ p90) so expected_margin is not forced
+# onto a hard cliff; only extreme coeffs are progressively zeroed for display
+# and for grid scores above the realistic band.
+# Defaults; overridden per-source from training quantiles when available.
+ACCEPTANCE_DECAY_START = 1.90
+ACCEPTANCE_DECAY_ZERO = 2.80
 
 
 class QuoteEstimator:
@@ -130,6 +125,9 @@ class QuoteEstimator:
             "regressor_mode": metadata.get("mode"),
             "target_transform": metadata.get("target_transform", "identity"),
             "coeff_clip": metadata.get("coeff_clip") or [0.80, 4.00],
+            "coeff_p50": metadata.get("coeff_p50"),
+            "coeff_p75": metadata.get("coeff_p75"),
+            "coeff_p90": metadata.get("coeff_p90"),
             "small_n_blend": float(metadata.get("small_n_blend") or 0.0),
             "metrics": metrics,
         }
@@ -248,6 +246,7 @@ class QuoteEstimator:
             log_price=True,
             include_cost=True,
             log_cost=True,
+            include_unit_price=True,
             **self._feature_kwargs(bundle),
         )
 
@@ -270,16 +269,35 @@ class QuoteEstimator:
             fournisseur=fournisseur,
         )
 
-        # Coeff-based decay (see ACCEPTANCE_DECAY_START / _ZERO at top of file).
+        # Soft decay above historical mass (see module-level constants /
+        # per-source p90). Keeps extreme coeffs from looking "acceptable".
+        decay_start, decay_zero = self._decay_bounds(source)
         coeff = (
             pd.to_numeric(rows["prix_total"], errors="coerce")
             / pd.to_numeric(rows["cout_total"], errors="coerce").replace(0, np.nan)
         ).to_numpy(dtype=float)
-        span = ACCEPTANCE_DECAY_ZERO - ACCEPTANCE_DECAY_START
-        decay_frac = np.clip((coeff - ACCEPTANCE_DECAY_START) / span, 0.0, 1.0)
+        span = max(decay_zero - decay_start, 1e-6)
+        decay_frac = np.clip((coeff - decay_start) / span, 0.0, 1.0)
         decay_mult = np.where(np.isnan(coeff), 1.0, 1.0 - decay_frac)
 
         return np.clip(base_proba * proba_mult * decay_mult, 0.0, 0.9999)
+
+    def _decay_bounds(self, source: str) -> tuple[float, float]:
+        """Decay starts just above historical p90; zeros toward the outlier clip."""
+        try:
+            bundle = self._load_source(source)
+        except Exception:
+            return ACCEPTANCE_DECAY_START, ACCEPTANCE_DECAY_ZERO
+        p90 = bundle.get("coeff_p90")
+        hi_c = (bundle.get("coeff_clip") or [0.8, 4.0])[-1]
+        if p90 is None:
+            # Fallbacks from last training quantiles
+            p90 = {"ponceblanc": 1.80, "lbfi": 1.30}.get(source, ACCEPTANCE_DECAY_START)
+        start = float(p90) * 1.02
+        zero = min(float(hi_c), float(p90) * 1.45)
+        if zero <= start:
+            zero = start + 0.35
+        return start, zero
 
     def predict_acceptance_proba(
         self,
@@ -472,13 +490,19 @@ class QuoteEstimator:
         reg_lower = min(reg_lower, reg_median)
         reg_upper = max(reg_upper, reg_median)
 
-        # Historical p75 accepted coeffs (ambitious-but-realistic ceiling for balanced)
-        # PB ≈ 1.57, LBFI ≈ 1.22 — stored as soft defaults if priors lack a p75.
+        # Realistic commercial ceilings from training quantiles (not outlier clip).
+        # PB ≈ p75 1.5 / p90 1.80 ; LBFI ≈ p75 1.22 / p90 1.30
         priors_global = float((bundle.get("coeff_priors") or {}).get("global") or c_med)
-        hist_p75 = {
-            "ponceblanc": 1.57,
-            "lbfi": 1.22,
-        }.get(source, priors_global * 1.12)
+        hist_p75 = float(
+            bundle.get("coeff_p75")
+            or {"ponceblanc": 1.50, "lbfi": 1.22}.get(source, priors_global * 1.08)
+        )
+        hist_p90 = float(
+            bundle.get("coeff_p90")
+            or {"ponceblanc": 1.80, "lbfi": 1.30}.get(source, priors_global * 1.15)
+        )
+        # Never search above the outlier clip either
+        realistic_hi = min(float(hi_c), float(hist_p90))
 
         def _grid_pick(grid_lo: float, grid_hi: float, n: int = 10):
             grid_lo = max(float(grid_lo), cost * 1.02)
@@ -518,11 +542,13 @@ class QuoteEstimator:
             )
 
         if mode == "expected_margin":
+            # Cap at historical p90 — NOT the outlier clip (was causing ~1.8
+            # or the clip ceiling every time when paired with hard decay).
             try:
                 median, best_proba, best_score = _grid_pick(
                     cost * max(lo_c, 1.02),
-                    cost * hi_c * price_mult,
-                    n=12,
+                    cost * realistic_hi * price_mult,
+                    n=14,
                 )
             except Exception:
                 median, best_proba, best_score = float(reg_median), float("nan"), float("nan")
@@ -530,17 +556,16 @@ class QuoteEstimator:
             upper = max(cost, max(reg_upper, median * 1.05))
             result_mode = "expected_margin"
         elif mode == "balanced":
-            # Ambitious but realistic: search only between the regressor price
-            # and min(+15 % uplift, historical p75 coeff). Never below the
-            # regressor median — we stay at least as ambitious as history.
-            cap_price = cost * min(hist_p75, hi_c) * price_mult
-            band_hi = min(max(reg_median * 1.15, reg_median), max(cap_price, reg_median))
+            # Ambitious but realistic: between regressor median and min(+12 %, p75).
+            cap_price = cost * min(hist_p75, realistic_hi) * price_mult
+            band_hi = max(float(reg_median), min(float(reg_median) * 1.12, float(cap_price)))
+            if band_hi <= reg_median * 1.001:
+                band_hi = max(reg_median * 1.05, min(cap_price, reg_median * 1.12))
             band_lo = float(reg_median)
             try:
                 median, best_proba, best_score = _grid_pick(band_lo, band_hi, n=8)
             except Exception:
-                # Fallback: modest fixed uplift toward p75
-                target_coeff = min(c_med * 1.10, hist_p75)
+                target_coeff = min(c_med * 1.08, hist_p75)
                 median = max(cost, target_coeff * cost) * price_mult
                 best_proba, best_score = float("nan"), float("nan")
                 try:

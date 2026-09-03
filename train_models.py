@@ -6,8 +6,8 @@ Train separate models for Ponceblanc and LBFI.
 
 Both sources now use the same euro logic when cost data is available:
     - classifier sees candidate selling price in euros + total cost in euros
-      + all available context features (matiere, format, commercial, calendar,
-      dimensions when present; historical delai is NOT a feature)
+      + unit price (log1p(prix/qty)) + calendar season features
+      (historical delai is NOT a feature)
     - price regressor predicts coefficient = prix / coût on accepted quotes;
       price is recovered as coefficient × coût
 """
@@ -82,6 +82,7 @@ def train_classifier(
     client_encoding,
     encodings,
     output_dir,
+    include_unit_price=True,
 ):
     kwargs = _feature_kwargs(encodings)
 
@@ -93,6 +94,7 @@ def train_classifier(
         log_price=True,
         include_cost=True,
         log_cost=True,
+        include_unit_price=include_unit_price,
         **kwargs,
     )
 
@@ -104,6 +106,7 @@ def train_classifier(
         log_price=True,
         include_cost=True,
         log_cost=True,
+        include_unit_price=include_unit_price,
         **kwargs,
     )
 
@@ -344,11 +347,20 @@ def train_price_regressor(
     with open(output_dir / "margin_feature_columns.json", "w", encoding="utf-8") as f:
         json.dump(list(X_train.columns), f)
 
+    # Realistic commercial band from accepted-quote distribution (not the
+    # outlier clip). Used by recommend_price so expected_margin / balanced
+    # stay inside the historical mass instead of drifting to the clip ceiling.
+    p50 = float(reg_df["coeff"].median())
+    p75 = float(reg_df["coeff"].quantile(0.75))
+    p90 = float(reg_df["coeff"].quantile(0.90))
     meta = {
         "target": "coefficient",
         "mode": "coeff_times_cost",
         "target_transform": "log",
         "coeff_clip": [lo, hi],
+        "coeff_p50": p50,
+        "coeff_p75": p75,
+        "coeff_p90": p90,
         "small_n_blend": blend,
         "uses_coeff_priors": True,
     }

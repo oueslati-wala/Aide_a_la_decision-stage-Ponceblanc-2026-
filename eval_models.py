@@ -289,6 +289,7 @@ def evaluate_source(source: str, verbose: bool = True) -> dict:
         log_price=True,
         include_cost=True,
         log_cost=True,
+        include_unit_price=True,
         **feat_kwargs,
     )
     if hasattr(classifier, "feature_names_in_"):
