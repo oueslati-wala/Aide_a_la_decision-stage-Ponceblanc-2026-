@@ -622,6 +622,51 @@ if page == "Aide à la décision":
             preferred_client, preferred_produit = "ROUGE_GORGE", "ECHANTILLONNAGE"
             default_qty, default_cost = 400, 800.0
 
+        # Apply any pending form updates written by the chat assistant
+        # *before* the widgets are created.
+        #
+        # For number_input fields Streamlit often ignores a plain overwrite of
+        # the widget key. We therefore:
+        #   1. store the canonical value under a stable key (e.g. achat_ponceblanc)
+        #   2. bump a version counter so the widget gets a *new* key and is
+        #      recreated with the fresh value.
+        _numeric_fields = ("quantite", "achat", "fabrication", "transport")
+        _applied_from_chat: list[str] = []
+
+        for _field, _cast in (
+            ("client", str),
+            ("produit", str),
+            ("quantite", lambda v: max(1, int(float(v)))),
+            ("achat", float),
+            ("fabrication", float),
+            ("transport", float),
+        ):
+            _pk = f"_pending_{_field}_{source}"
+            if _pk in st.session_state:
+                _val = _cast(st.session_state.pop(_pk))
+                st.session_state[f"{_field}_{source}"] = _val
+                if _field in _numeric_fields:
+                    _vk = f"_ver_{_field}_{source}"
+                    st.session_state[_vk] = int(st.session_state.get(_vk, 0)) + 1
+                _applied_from_chat.append(f"{_field}={_val}")
+
+        # Date / season / use_season use slightly different key names
+        for _src_field, _dst_key in (
+            ("date", f"date_{source}"),
+            ("season4m", f"season4m_{source}"),
+            ("use_season", f"use_season_{source}"),
+        ):
+            _pk = f"_pending_{_src_field}_{source}"
+            if _pk in st.session_state:
+                st.session_state[_dst_key] = st.session_state.pop(_pk)
+                _applied_from_chat.append(f"{_src_field}={st.session_state[_dst_key]}")
+
+        if _applied_from_chat:
+            st.caption(
+                "🔄 Formulaire mis à jour par l'assistant : "
+                + " · ".join(_applied_from_chat)
+            )
+
         # Ensure values written by the chat assistant appear in selectbox options
         _ss_client = st.session_state.get(f"client_{source}")
         if _ss_client and str(_ss_client) not in known_clients:
@@ -642,15 +687,16 @@ if page == "Aide à la décision":
             if default_c not in client_options:
                 client_options.insert(0, default_c)
 
-            _client_kwargs = dict(
+            # Initialise session_state so the selectbox never needs a value= arg
+            if f"client_{source}" not in st.session_state:
+                st.session_state[f"client_{source}"] = default_c
+            client = st.selectbox(
+                "Client",
                 options=client_options,
                 accept_new_options=True,
                 key=f"client_{source}",
                 help="Tapez pour filtrer la liste, ou saisissez un client.",
             )
-            if f"client_{source}" not in st.session_state:
-                _client_kwargs["index"] = client_options.index(default_c)
-            client = st.selectbox("Client", **_client_kwargs)
             client = str(client).strip()
 
             default_p = (
@@ -662,15 +708,15 @@ if page == "Aide à la décision":
             if default_p not in prod_options:
                 prod_options.insert(0, default_p)
 
-            _prod_kwargs = dict(
+            if f"produit_{source}" not in st.session_state:
+                st.session_state[f"produit_{source}"] = default_p
+            produit = st.selectbox(
+                "Produit / type",
                 options=prod_options,
                 accept_new_options=True,
                 key=f"produit_{source}",
                 help="Tapez pour filtrer la liste, ou saisissez un produit.",
             )
-            if f"produit_{source}" not in st.session_state:
-                _prod_kwargs["index"] = prod_options.index(default_p)
-            produit = st.selectbox("Produit / type", **_prod_kwargs)
             produit = features.normalize_produit(str(produit).strip())
             if not isinstance(produit, str):
                 produit = str(produit)
@@ -685,37 +731,65 @@ if page == "Aide à la décision":
                 _alias_txt = f" (variantes fusionnées : {', '.join(_aliases)})" if _aliases else ""
                 st.caption(f"**{produit}** : **{_n_prod}** devis dans l'historique de cette source{_alias_txt}.")
 
+            # Canonical value lives in quantite_{source}; widget key is versioned
+            # so a chat update forces Streamlit to recreate the widget.
+            if f"quantite_{source}" not in st.session_state:
+                st.session_state[f"quantite_{source}"] = int(default_qty)
+            _q_ver = int(st.session_state.get(f"_ver_quantite_{source}", 0))
+            _q_wkey = f"quantite_{source}_w{_q_ver}"
+            if _q_wkey not in st.session_state:
+                st.session_state[_q_wkey] = int(st.session_state[f"quantite_{source}"])
             quantite = st.number_input(
-                        "Quantité (Nb exemplaires)",
-                        min_value=1,
-                        value=default_qty,
-                        step=50,
-                        key=f"quantite_{source}",
-                    )
-
+                "Quantité (Nb exemplaires)",
+                min_value=1,
+                step=50,
+                key=_q_wkey,
+            )
+            st.session_state[f"quantite_{source}"] = int(quantite)
 
         with col_b:
+            if f"achat_{source}" not in st.session_state:
+                st.session_state[f"achat_{source}"] = float(default_cost * 0.40)
+            _a_ver = int(st.session_state.get(f"_ver_achat_{source}", 0))
+            _a_wkey = f"achat_{source}_w{_a_ver}"
+            if _a_wkey not in st.session_state:
+                st.session_state[_a_wkey] = float(st.session_state[f"achat_{source}"])
             cout_achat = st.number_input(
                 "Coût achat (€)",
                 min_value=0.0,
-                value=default_cost * 0.40,
                 step=10.0,
-                key=f"achat_{source}",
+                key=_a_wkey,
             )
+            st.session_state[f"achat_{source}"] = float(cout_achat)
+
+            if f"fabrication_{source}" not in st.session_state:
+                st.session_state[f"fabrication_{source}"] = float(default_cost * 0.25)
+            _f_ver = int(st.session_state.get(f"_ver_fabrication_{source}", 0))
+            _f_wkey = f"fabrication_{source}_w{_f_ver}"
+            if _f_wkey not in st.session_state:
+                st.session_state[_f_wkey] = float(st.session_state[f"fabrication_{source}"])
             cout_fabrication = st.number_input(
                 "Coût fabrication (€)",
                 min_value=0.0,
-                value=default_cost * 0.25,
                 step=10.0,
-                key=f"fabrication_{source}",
+                key=_f_wkey,
             )
+            st.session_state[f"fabrication_{source}"] = float(cout_fabrication)
+
+            if f"transport_{source}" not in st.session_state:
+                st.session_state[f"transport_{source}"] = float(default_cost * 0.15)
+            _t_ver = int(st.session_state.get(f"_ver_transport_{source}", 0))
+            _t_wkey = f"transport_{source}_w{_t_ver}"
+            if _t_wkey not in st.session_state:
+                st.session_state[_t_wkey] = float(st.session_state[f"transport_{source}"])
             cout_transport = st.number_input(
                 "Coût transport (€)",
                 min_value=0.0,
-                value=default_cost * 0.15,
                 step=10.0,
-                key=f"transport_{source}",
+                key=_t_wkey,
             )
+            st.session_state[f"transport_{source}"] = float(cout_transport)
+
             cout_total = float(cout_achat + cout_fabrication + cout_transport)
             st.number_input(
                 "Coût total calculé (€)",
@@ -1866,6 +1940,21 @@ if page == "Aide à la décision":
                                 "cout_fabrication": float(cout_fabrication),
                                 "cout_transport": float(cout_transport),
                                 "cout_total": float(cout_total),
+                                "date_devis": (
+                                    date_devis.isoformat()
+                                    if date_devis is not None
+                                    else None
+                                ),
+                                "saison": int(season_4m) if season_4m is not None else None,
+                                "use_season": bool(use_season),
+                                # Same values used by cached_recommend() below,
+                                # so the chat's price tool can reproduce the
+                                # exact numbers shown in "2. Proposition du
+                                # modèle" for this offer.
+                                "month": int(month) if month is not None else None,
+                                "year": int(year) if year is not None else None,
+                                "pricing_mode": pricing_mode,
+                                "low_acceptance_percentile": float(low_acc_pct),
                             }
                             error_detail = None
                             try:
@@ -1886,21 +1975,42 @@ if page == "Aide à la décision":
                                         source_hint=source,
                                     )
                             except Exception as exc:
-                                reply = (
-                                    "⚠️ L'assistant n'a pas pu répondre "
-                                    "(problème de configuration)."
-                                )
-                                error_detail = str(exc)
+                                import traceback as _tb
+                                msg = str(exc)
+                                low = msg.lower()
+                                tb_txt = _tb.format_exc()
+                                if (
+                                    "no module named 'openai'" in low
+                                    or ("openai" in low and "import" in low)
+                                ):
+                                    reply = (
+                                        "⚠️ Module **openai** manquant sur le serveur.\n\n"
+                                        "Ajoutez `openai>=1.40.0` dans `requirements.txt`, "
+                                        "commitez, et redéployez / reboot l'app Streamlit Cloud."
+                                    )
+                                elif (
+                                    "openrouter_api_key" in low
+                                    or "api key" in low
+                                    or ("manquant" in low and "key" in low)
+                                    or "401" in msg
+                                ):
+                                    reply = (
+                                        "⚠️ Clé **OpenRouter** absente ou refusée.\n\n"
+                                        "Sur Streamlit Cloud : **App → ⋮ → Settings → Secrets**\n\n"
+                                        "```toml\nOPENROUTER_API_KEY = \"sk-or-v1-…\"\n```\n\n"
+                                        "Puis **Save** et reboot de l'app. "
+                                        "Pas de section `[...]` autour, clé en haut de fichier."
+                                    )
+                                else:
+                                    reply = (
+                                        "⚠️ L'assistant n'a pas pu répondre.\n\n"
+                                        f"**Erreur :** `{msg}`"
+                                    )
+                                error_detail = tb_txt if tb_txt else msg
                             if error_detail:
                                 st.markdown(reply)
-                                with st.expander("Détail technique"):
+                                with st.expander("Détail technique (à coller si le problème continue)"):
                                     st.code(error_detail)
-                                    st.caption(
-                                        "Vérifiez `OPENROUTER_API_KEY` dans "
-                                        "`.streamlit/secrets.toml` et `pip install openai`. "
-                                        "Si l'erreur mentionne `form_context`, redémarrez "
-                                        "Streamlit pour recharger `chat_assistant.py`."
-                                    )
                             else:
                                 st.markdown(reply)
                 st.session_state.chat_messages.append(
