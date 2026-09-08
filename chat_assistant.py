@@ -15,10 +15,11 @@ Read-only by design: no tool here writes to Odoo, models/, or any file.
 It only reads history and calls prediction functions that already exist in
 predict.py.
 
-Backend: MiniMax M3 (free) via OpenRouter
-  model  = minimax/minimax-m3:free
+Backend: NVIDIA Nemotron 3 Ultra (free) via OpenRouter
+  model  = nvidia/nemotron-3-ultra-550b-a55b:free
   base   = https://openrouter.ai/api/v1
   key    = OPENROUTER_API_KEY
+  (override at runtime with the CHAT_ASSISTANT_MODEL env var / secret)
 
 Usage from vis.py:
 
@@ -49,9 +50,14 @@ from predict import QuoteEstimator
 # CONFIG
 # ---------------------------------------------------------------------
 
-# MiniMax M3 free on OpenRouter
+# NVIDIA Nemotron 3 Ultra free on OpenRouter (minimax/minimax-m3:free was
+# retired from OpenRouter's catalog). Confirmed to support tool/function
+# calling, which this module depends on for every price/probability lookup.
+# Override without a redeploy via the CHAT_ASSISTANT_MODEL secret/env var —
+# e.g. "openrouter/free" to auto-route across available free models if this
+# one is ever retired too.
 CHAT_MODEL = os.environ.get(
-    "CHAT_ASSISTANT_MODEL", "minimax/minimax-m3:free"
+    "CHAT_ASSISTANT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"
 )
 OPENROUTER_BASE_URL = os.environ.get(
     "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"

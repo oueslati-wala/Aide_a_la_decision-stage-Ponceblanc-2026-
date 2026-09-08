@@ -25,6 +25,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import features
 from predict import QuoteEstimator
@@ -557,6 +558,44 @@ if page == "Aide à la décision":
         st.session_state.chat_open = False
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
+    if "voice_draft" not in st.session_state:
+        st.session_state.voice_draft = ""
+
+    # Speech-to-text bridge (query params written by the mic component).
+    # ?stt=...  → auto-send into the chat (same as typing + Enter)
+    # ?draft=... → only fill the dictée field (fallback if auto-send is blocked)
+    try:
+        _qp = st.query_params
+        _stt_qp = _qp.get("stt")
+        _draft_qp = _qp.get("draft")
+        _changed = False
+        if _stt_qp:
+            if isinstance(_stt_qp, (list, tuple)):
+                _stt_qp = _stt_qp[0] if _stt_qp else ""
+            _stt_text = str(_stt_qp).strip()
+            if _stt_text:
+                st.session_state["_pending_chat_input"] = _stt_text
+                st.session_state.voice_draft = ""
+                _changed = True
+            try:
+                del st.query_params["stt"]
+            except Exception:
+                pass
+        if _draft_qp and not _changed:
+            if isinstance(_draft_qp, (list, tuple)):
+                _draft_qp = _draft_qp[0] if _draft_qp else ""
+            _draft_text = str(_draft_qp).strip()
+            if _draft_text:
+                st.session_state.voice_draft = _draft_text
+                _changed = True
+            try:
+                del st.query_params["draft"]
+            except Exception:
+                pass
+        if _changed:
+            st.rerun()
+    except Exception:
+        pass
 
     # Assistant may request a source switch via update_form_inputs
     _chat_src = st.session_state.pop("_chat_requested_source", None)
@@ -1916,6 +1955,304 @@ if page == "Aide à la décision":
                         avatar = "🧑‍💼" if m["role"] == "user" else "🧾"
                         with st.chat_message(m["role"], avatar=avatar):
                             st.markdown(m["content"])
+
+            # --- Voice controls (mic dictation + spoken replies) ---
+            _last_assistant = ""
+            for _m in reversed(st.session_state.chat_messages):
+                if _m.get("role") == "assistant" and (_m.get("content") or "").strip():
+                    _last_assistant = str(_m["content"])
+                    break
+            _speak_text = (
+                _last_assistant.replace("**", "")
+                .replace("`", "")
+                .replace("⚠️", "")
+                .replace("#", "")
+                .replace("\n", " ")
+                .strip()
+            )
+            _speak_js = json.dumps(_speak_text[:1200])
+
+            components.html(
+                f"""
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"/>
+<style>
+  :root {{
+    --ink:#2B241C; --paper:#FFFDF9; --line:#E7D9C4; --muted:#A6987F;
+    --accent:#A9552F; --accent-ink:#7A3C1F; --ok:#64735A; --err:#A2483E;
+  }}
+  html, body {{ margin:0; padding:0; background:transparent; }}
+  * {{ box-sizing:border-box; font-family:Inter, system-ui, sans-serif; }}
+  .bar {{
+    display:flex; align-items:center; gap:8px;
+    background:var(--paper); border:1px solid var(--line); border-radius:999px;
+    padding:6px 8px; flex-wrap:nowrap;
+  }}
+  button {{
+    cursor:pointer; border:1px solid var(--line); background:#fff;
+    color:var(--ink); border-radius:999px; padding:7px 14px;
+    font-size:12.5px; font-weight:600; display:flex; align-items:center; gap:6px;
+    white-space:nowrap; transition:background .15s, border-color .15s, transform .1s;
+  }}
+  button:hover {{ background:#F2E9DB; }}
+  button:active {{ transform:scale(0.97); }}
+  button:disabled {{ opacity:.4; cursor:not-allowed; }}
+  #micBtn {{ background:var(--accent); border-color:var(--accent); color:#fff; }}
+  #micBtn:hover {{ background:var(--accent-ink); border-color:var(--accent-ink); }}
+  #micBtn.listening {{ background:var(--err); border-color:var(--err); animation:pulse 1.4s infinite; }}
+  #speakBtn.speaking {{ background:#F0DAC1; border-color:var(--accent); color:var(--accent-ink); }}
+  #autoBtn {{ padding:7px 10px; }}
+  #autoBtn.on {{ background:#EFE6D6; border-color:var(--accent); color:var(--accent-ink); }}
+  select#voiceSelect {{
+    max-width:108px; min-width:72px; flex:0 1 108px;
+    font-size:11px; color:var(--ink);
+    background:#fff; border:1px solid var(--line); border-radius:999px;
+    padding:5px 8px; font-family:Inter, system-ui, sans-serif;
+  }}
+  @keyframes pulse {{
+    0% {{ box-shadow:0 0 0 0 rgba(162,72,62,0.45); }}
+    70% {{ box-shadow:0 0 0 8px rgba(162,72,62,0); }}
+    100% {{ box-shadow:0 0 0 0 rgba(162,72,62,0); }}
+  }}
+  #status {{
+    font-size:11px; color:var(--muted); overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; min-width:0; flex:1; padding-left:4px;
+  }}
+</style>
+</head>
+<body>
+<div class="bar">
+  <button id="micBtn" title="Dicter votre question (français)">🎤 Dicter</button>
+  <button id="speakBtn" title="Lire la dernière réponse à voix haute">🔊 Lire</button>
+  <button id="autoBtn" title="Lire automatiquement chaque nouvelle réponse">🔁</button>
+  <select id="voiceSelect" title="Voix de lecture"></select>
+  <span id="status"></span>
+</div>
+<script>
+(function() {{
+  const storeKey = 'devis_voice_auto_speak';
+  const lastSpokenKey = 'devis_voice_last_spoken';
+  const status = document.getElementById('status');
+  const micBtn = document.getElementById('micBtn');
+  const speakBtn = document.getElementById('speakBtn');
+  const autoBtn = document.getElementById('autoBtn');
+  const voiceSelect = document.getElementById('voiceSelect');
+  const voiceKey = 'devis_voice_uri';
+  const speakText = {_speak_js};
+
+  function setStatus(t, color) {{
+    status.textContent = t || '';
+    status.style.color = color || '#A6987F';
+  }}
+
+  // ---- Auto-lire toggle: persisted client-side (localStorage), no
+  // server round-trip and no separate native widget to keep in sync. ----
+  function autoOn() {{ return localStorage.getItem(storeKey) === '1'; }}
+  function renderAuto() {{
+    autoBtn.classList.toggle('on', autoOn());
+    autoBtn.title = autoOn()
+      ? 'Lecture automatique activée — cliquez pour désactiver'
+      : 'Lecture automatique désactivée — cliquez pour activer';
+  }}
+  autoBtn.onclick = () => {{
+    localStorage.setItem(storeKey, autoOn() ? '0' : '1');
+    renderAuto();
+  }};
+  renderAuto();
+
+  // ---- Text-to-speech: pick + remember which voice to use ----
+  // Browsers ship many "fr-FR" voices of wildly different quality (some are
+  // robotic system voices); let the user pick and remember their choice
+  // instead of always grabbing whichever French voice loads first.
+  function frVoices(all) {{
+    const fr = all.filter(v => v.lang && v.lang.toLowerCase().startsWith('fr'));
+    return fr.length ? fr : all;
+  }}
+  function pickDefaultVoice(list) {{
+    // Prefer higher-quality network/neural voices when present.
+    const good = list.find(v => /google|natural|neural|online/i.test(v.name));
+    return good || list[0];
+  }}
+  function currentVoiceList() {{
+    return window.speechSynthesis ? frVoices(window.speechSynthesis.getVoices()) : [];
+  }}
+  function populateVoiceSelect() {{
+    const list = currentVoiceList();
+    if (!list.length) return;
+    const stored = localStorage.getItem(voiceKey);
+    const already = Array.from(voiceSelect.options).map(o => o.value);
+    const wanted = list.map(v => v.voiceURI);
+    if (already.length === wanted.length && already.every((v, i) => v === wanted[i])) {{
+      return; // list unchanged — don't fight the user's open dropdown
+    }}
+    voiceSelect.innerHTML = '';
+    list.forEach(v => {{
+      const opt = document.createElement('option');
+      opt.value = v.voiceURI;
+      // Short label to keep the compact select readable
+      let label = (v.name || 'Voix').replace(/\\s*\\(.*\\)\\s*$/, '');
+      if (label.length > 18) label = label.slice(0, 16) + '…';
+      opt.textContent = label;
+      voiceSelect.appendChild(opt);
+    }});
+    const match = stored && list.some(v => v.voiceURI === stored)
+      ? stored
+      : pickDefaultVoice(list).voiceURI;
+    voiceSelect.value = match;
+    if (!stored) {{ try {{ localStorage.setItem(voiceKey, match); }} catch (e) {{}} }}
+  }}
+  voiceSelect.onchange = () => {{
+    try {{ localStorage.setItem(voiceKey, voiceSelect.value); }} catch (e) {{}}
+  }};
+  if (window.speechSynthesis) {{
+    populateVoiceSelect();
+    window.speechSynthesis.onvoiceschanged = populateVoiceSelect;
+  }}
+
+  // ---- Text-to-speech ----
+  function speak(text) {{
+    if (!text || !window.speechSynthesis) {{
+      setStatus('Lecture indisponible sur ce navigateur', '#A2483E');
+      return;
+    }}
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'fr-FR';
+    u.rate = 1.05;
+    const list = currentVoiceList();
+    if (list.length) {{
+      const storedUri = localStorage.getItem(voiceKey);
+      const chosen = (storedUri && list.find(v => v.voiceURI === storedUri))
+        || pickDefaultVoice(list);
+      if (chosen) u.voice = chosen;
+    }}
+    u.onstart = () => {{ speakBtn.classList.add('speaking'); speakBtn.textContent = '⏹ Stop'; setStatus('Lecture…', '#64735A'); }};
+    u.onend = () => {{ speakBtn.classList.remove('speaking'); speakBtn.textContent = '🔊 Lire'; setStatus(''); }};
+    u.onerror = () => {{ speakBtn.classList.remove('speaking'); speakBtn.textContent = '🔊 Lire'; setStatus('Erreur de lecture', '#A2483E'); }};
+    window.speechSynthesis.speak(u);
+    try {{ localStorage.setItem(lastSpokenKey, text); }} catch (e) {{}}
+  }}
+
+  speakBtn.onclick = () => {{
+    if (window.speechSynthesis && window.speechSynthesis.speaking) {{
+      window.speechSynthesis.cancel();
+      speakBtn.classList.remove('speaking');
+      speakBtn.textContent = '🔊 Lire';
+      setStatus('');
+      return;
+    }}
+    speak(speakText);
+  }};
+
+  if (!window.speechSynthesis) {{
+    speakBtn.disabled = true;
+    autoBtn.disabled = true;
+    voiceSelect.disabled = true;
+  }} else if (autoOn() && speakText && localStorage.getItem(lastSpokenKey) !== speakText) {{
+    setTimeout(() => speak(speakText), 350);
+  }}
+
+  // ---- Speech-to-text ----
+  function sendToChat(text) {{
+    // 1) Best path: write straight into the visible chat box and submit —
+    //    no page reload, feels instant, single source of truth for input.
+    try {{
+      const doc = window.parent.document;
+      const box = doc.querySelector('textarea[data-testid="stChatInputTextArea"]');
+      if (box) {{
+        const setter = Object.getOwnPropertyDescriptor(
+          window.parent.HTMLTextAreaElement.prototype, 'value'
+        ).set;
+        setter.call(box, text);
+        box.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        box.focus();
+        setTimeout(() => {{
+          box.dispatchEvent(new KeyboardEvent('keydown', {{
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+          }}));
+        }}, 60);
+        setStatus('Envoyé : « ' + text + ' »', '#64735A');
+        return;
+      }}
+    }} catch (e) {{}}
+    // 2) Fallback: soft URL update that Streamlit picks up as a rerun,
+    //    without a full browser page reload.
+    try {{
+      const w = window.parent;
+      const url = new URL(w.location.href);
+      url.searchParams.set('stt', text);
+      w.history.pushState({{}}, '', url.toString());
+      w.dispatchEvent(new PopStateEvent('popstate'));
+      setStatus('Envoyé : « ' + text + ' »', '#64735A');
+      return;
+    }} catch (e) {{}}
+    // 3) Last resort: fill the manual "solution de secours" field below.
+    try {{
+      const w = window.parent;
+      const url = new URL(w.location.href);
+      url.searchParams.set('draft', text);
+      w.history.pushState({{}}, '', url.toString());
+      w.dispatchEvent(new PopStateEvent('popstate'));
+      setStatus('Transcrit — vérifiez le champ ci-dessous', '#A9552F');
+    }} catch (e) {{
+      setStatus(text + ' — copiez ce texte manuellement', '#A2483E');
+    }}
+  }}
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {{
+    micBtn.disabled = true;
+    setStatus('Dictée non supportée — utilisez Chrome ou Edge', '#A2483E');
+  }} else {{
+    let rec = null;
+    let listening = false;
+    micBtn.onclick = () => {{
+      if (listening && rec) {{ try {{ rec.stop(); }} catch (e) {{}} return; }}
+      rec = new SR();
+      rec.lang = 'fr-FR';
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+      rec.onstart = () => {{
+        listening = true;
+        micBtn.classList.add('listening');
+        micBtn.textContent = '⏹ Stop';
+        setStatus('Je vous écoute…', '#A9552F');
+      }};
+      rec.onend = () => {{
+        listening = false;
+        micBtn.classList.remove('listening');
+        micBtn.textContent = '🎤 Dicter';
+      }};
+      rec.onerror = (ev) => {{
+        listening = false;
+        micBtn.classList.remove('listening');
+        micBtn.textContent = '🎤 Dicter';
+        const err = (ev && ev.error) ? ev.error : 'erreur';
+        if (err === 'not-allowed') setStatus('Accès micro refusé', '#A2483E');
+        else if (err === 'no-speech') setStatus('Rien entendu, réessayez', '#A6987F');
+        else if (err !== 'aborted') setStatus(err, '#A2483E');
+      }};
+      rec.onresult = (ev) => {{
+        let interim = '', final = '';
+        for (let i = ev.resultIndex; i < ev.results.length; i++) {{
+          const t = ev.results[i][0].transcript;
+          if (ev.results[i].isFinal) final += t; else interim += t;
+        }}
+        if (interim) setStatus(interim, '#A6987F');
+        if (final && final.trim()) {{
+          setStatus(final.trim(), '#64735A');
+          sendToChat(final.trim());
+        }}
+      }};
+      try {{ rec.start(); }} catch (e) {{ setStatus('Micro indisponible', '#A2483E'); }}
+    }};
+  }}
+}})();
+</script>
+</body></html>
+                """,
+                height=48,
+            )
 
             user_text = st.chat_input("Votre question…", key="main_chat_input")
             pending = st.session_state.pop("_pending_chat_input", None)
