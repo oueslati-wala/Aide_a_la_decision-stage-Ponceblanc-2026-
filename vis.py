@@ -1933,7 +1933,7 @@ if page == "Aide à la décision":
                         <div style="text-align:center; padding: 0.9rem 0.7rem 0.3rem;">
                         <div style="font-size:1.4rem; margin-bottom:0.25rem;">💬</div>
                         <div style="font-family:'IBM Plex Mono', monospace; font-size:0.76rem; color:#A6987F;">
-                        Posez une question sur un prix, un client, ou l'historique.
+                        Historique commercial, devis similaires, évolution client / produit…
                         </div>
                         </div>
                         """,
@@ -1941,10 +1941,10 @@ if page == "Aide à la décision":
                     )
                     st.caption("Exemples :")
                     suggestions = [
-                        "Quel prix proposer à ce client ?",
-                        f"Historique pour {client} sur {produit}",
-                        "Quels sont les clients les plus fréquents ?",
-                        "Ce client accepte-t-il souvent nos devis ?",
+                        f"Ai-je déjà fait un devis similaire pour {client} / {produit} ?",
+                        f"Comment évolue mon taux d'acceptation pour {client} ?",
+                        f"{client} me sollicite-t-il plus ou moins que l'an dernier ?",
+                        f"Comment évolue la demande pour {produit} ?",
                     ]
                     for i, s in enumerate(suggestions):
                         if st.button(s, key=f"sugg_{source}_{i}", use_container_width=True):
