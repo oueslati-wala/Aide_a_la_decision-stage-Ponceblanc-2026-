@@ -16,7 +16,7 @@ It only reads history and calls prediction functions that already exist in
 predict.py.
 
 Backend: NVIDIA Nemotron 3 Ultra (free) via OpenRouter
-  model  = nvidia/nemotron-3-ultra-550b-a55b:free
+  model  = openrouter/free  (override with CHAT_ASSISTANT_MODEL)
   base   = https://openrouter.ai/api/v1
   key    = OPENROUTER_API_KEY
   (override at runtime with the CHAT_ASSISTANT_MODEL env var / secret)
@@ -42,6 +42,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+import commercial_data
+import eval_models
 import features
 from predict import QuoteEstimator
 
@@ -57,7 +59,10 @@ from predict import QuoteEstimator
 # e.g. "openrouter/free" to auto-route across available free models if this
 # one is ever retired too.
 CHAT_MODEL = os.environ.get(
-    "CHAT_ASSISTANT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"
+    # openrouter/free auto-routes across available free models when one
+    # endpoint is rate-limited or returns empty choices. Override anytime
+    # via CHAT_ASSISTANT_MODEL secret/env (e.g. nvidia/nemotron-3-super-120b-a12b:free).
+    "CHAT_ASSISTANT_MODEL", "openrouter/free"
 )
 OPENROUTER_BASE_URL = os.environ.get(
     "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
@@ -128,6 +133,34 @@ Maximiser le % d'acceptation :
 
 Autres outils :
 - get_seasonality_stats pour volume par mois / saison / année.
+- get_model_performance pour la fiabilité du modèle (AUC, erreur du prix
+  recommandé, score de confiance /100) : utilise ceci quand on te demande
+  si on peut faire confiance aux recommandations, si le modèle se trompe
+  souvent, ou quelle est sa marge d'erreur. Même contenu que la page
+  « Performance des modèles » de l'interface.
+- get_app_guide pour expliquer le fonctionnement de l'outil lui-même (à
+  quoi sert un champ, ce que signifie un résultat affiché, le principe
+  technique, les limites connues) : utilise ceci quand on te demande
+  « comment ça marche », « que veut dire ce champ / ce résultat », plutôt
+  qu'un calcul. Même contenu que la page « Guide d'utilisation ».
+
+Outils du TABLEAU DE BORD COMMERCIAL (fichier Query_tableau_devis.xlsx,
+DISTINCT du fichier avec coûts utilisé par les modèles de prix — les
+chiffres peuvent légèrement différer) :
+- get_commercial_kpis : CA devisé/signé, % succès, nb devis/commandes,
+  panier moyen, pour une année.
+- get_client_abc_category : catégorie ABC d'un client (grand compte /
+  intermédiaire / petit client / nouveau client) pour une année.
+- get_commercial_breakdown : répartition du CA signé par catégorie ABC,
+  type de produit, ou commercial.
+- get_delay_stats : délai moyen devis → ouverture dossier fabrication.
+Quand tu réponds avec des chiffres venant de ces outils, précise qu'ils
+viennent du "tableau de bord commercial" (pas des modèles de prix), pour
+que l'utilisateur sache d'où vient le chiffre s'il le compare à autre
+chose. Ne mélange jamais dans une même phrase un chiffre de ces outils et
+un chiffre de get_price_recommendation / get_similar_history sans le
+préciser — ce sont deux sources de données différentes.
+
 - Tu ne modifies rien d'autre (pas d'écriture dans Odoo, pas de fichier).
 """
 
@@ -153,6 +186,19 @@ def _get_history(source: str) -> pd.DataFrame:
     if source not in _history_cache:
         _history_cache[source] = features.build_source(source)
     return _history_cache[source]
+
+
+_performance_cache: dict[str, dict] = {}
+
+
+def _get_performance(source: str) -> dict:
+    """Held-out evaluation metrics (AUC, calibration, price error, trust
+    score) for one source — the exact same eval_models.evaluate_source()
+    call the 'Performance des modèles' page makes. Cached per process since
+    it re-runs a hold-out pass; no need to repeat it on every chat turn."""
+    if source not in _performance_cache:
+        _performance_cache[source] = eval_models.evaluate_source(source, verbose=False)
+    return _performance_cache[source]
 
 
 # ---------------------------------------------------------------------
@@ -186,6 +232,8 @@ def _tool_price_recommendation(args: dict) -> dict:
             month=int(month) if month is not None else None,
             year=int(year) if year is not None else None,
         )
+        if not rec or "prix_median" not in rec:
+            return {"error": "Le modèle n'a renvoyé aucune recommandation de prix."}
         prix = float(rec["prix_median"])
         marge_eur = prix - cout_total
         return {
@@ -669,6 +717,394 @@ def _tool_seasonality_stats(args: dict) -> dict:
     }
 
 
+def _tool_model_performance(args: dict) -> dict:
+    """Distilled version of the 'Performance des modèles' page for one
+    source: classifier AUC/accuracy, price-regressor error (%, €), and the
+    same 0-100 trust score + advice shown there. Every figure comes straight
+    from eval_models.evaluate_source() — nothing is computed or estimated
+    here."""
+    source = str(args.get("source", "")).lower()
+    if source not in ("ponceblanc", "lbfi"):
+        return {"error": "source doit être 'ponceblanc' ou 'lbfi'."}
+
+    try:
+        perf = _get_performance(source)
+    except Exception as exc:  # defensive: eval_models can raise many kinds
+        return {"error": f"Évaluation impossible pour {source}: {exc}"}
+
+    clf = perf.get("classifier", {}) or {}
+    reg = perf.get("regressor", {}) or {}
+    trust = perf.get("trust", {}) or {}
+    auc = clf.get("roc_auc")
+    within20 = reg.get("within_20pct")
+    median_ape = reg.get("median_ape")
+    mae_eur = reg.get("mae_eur")
+    baseline_mae_eur = reg.get("baseline_mae_eur")
+
+    return {
+        "source": source,
+        "n_devis_historique": perf.get("n_total"),
+        "n_devis_test": perf.get("n_test"),
+        "taux_acceptation_historique_pct": (
+            round(100 * perf["acceptance_rate"], 1)
+            if perf.get("acceptance_rate") is not None else None
+        ),
+        "classifieur_acceptation": {
+            "auc": round(auc, 3) if auc is not None else None,
+            "interpretation": clf.get("interpret_auc"),
+            "accuracy_pct": (
+                round(100 * clf["accuracy"], 1)
+                if clf.get("accuracy") is not None else None
+            ),
+            "accuracy_baseline_majorite_pct": (
+                round(100 * clf["baseline_accuracy"], 1)
+                if clf.get("baseline_accuracy") is not None else None
+            ),
+        },
+        "regresseur_prix": {
+            "erreur_mediane_pct": (
+                round(100 * median_ape, 1) if median_ape is not None else None
+            ),
+            "part_prix_dans_20pct_du_vrai_prix": (
+                round(100 * within20, 1) if within20 is not None else None
+            ),
+            "mae_prix_eur": round(mae_eur, 0) if mae_eur is not None else None,
+            "bat_regle_naive_coeff_median": (
+                bool(mae_eur <= baseline_mae_eur * 1.02)
+                if mae_eur is not None and baseline_mae_eur is not None
+                else None
+            ),
+            "n_devis_acceptes_utilises": reg.get("n_rows"),
+        },
+        "score_confiance_sur_100": trust.get("score"),
+        "niveau_confiance": trust.get("label"),
+        "conseil_utilisation": trust.get("advice"),
+        "raisons": trust.get("reasons"),
+    }
+
+
+# Static content mirroring the "Guide d'utilisation" page (page 3 of the
+# interface). Kept here verbatim so the chat's explanations of how the tool
+# itself works never drift from what the Guide page actually says.
+_APP_GUIDE_FR: dict[str, str] = {
+    "apercu": (
+        "L'outil aide à choisir un prix de vente total (€) pour un devis, en "
+        "s'appuyant sur l'historique des offres acceptées / refusées de la "
+        "même source (Ponceblanc ou LBFI). Trois pages dans l'interface : "
+        "« Aide à la décision » (le formulaire de pricing + ce chat), "
+        "« Performance des modèles » (fiabilité technique : AUC, "
+        "calibration, erreur de prix — voir get_model_performance), et "
+        "« Guide d'utilisation » (mode d'emploi détaillé)."
+    ),
+    "champs_saisis": (
+        "Champs du formulaire : Source (Ponceblanc ou LBFI, modèles "
+        "entraînés séparément) ; Client (liste historique + saisie libre) ; "
+        "Produit / type ; Quantité (nombre d'exemplaires) ; Coût (€) = "
+        "achat + fabrication + transport → total ; Date / saison "
+        "(optionnelle, via une bascule) — si activée, la date est convertie "
+        "en une saison de 4 mois : S1 = jan–avr, S2 = mai–aoû, S3 = sep–déc."
+    ),
+    "sorties_modele": (
+        "Ce que le modèle renvoie : (1) Prix recommandé (€) — montant "
+        "typique parmi les devis acceptés pour un profil proche (coût, "
+        "client, produit, volume) ; (2) P(acceptation) — probabilité "
+        "qu'une offre à ce prix soit signée, d'après le classifieur ; "
+        "(3) Scénarios Prudent / Recommandé / Ambitieux / Meilleure "
+        "P(accept), plus une ligne « Votre choix » éditable ; (4) Courbe de "
+        "sensibilité — P(acceptation) en fonction du prix de vente, coût "
+        "fixé ; (5) Devis historiques comparables, pour justification."
+    ),
+    "principe_technique": (
+        "Principe commun aux deux sources : un régresseur prédit un "
+        "coefficient (prix / coût) sur les devis signés, puis "
+        "prix_recommandé = coefficient × coût_total. Un classifieur estime "
+        "séparément P(acceptation | client, produit, quantité, coût, prix "
+        "candidat). Les taux de marge affichés dans l'interface sont "
+        "uniquement pour lecture ; ce ne sont jamais des entrées du modèle."
+    ),
+    "limites": (
+        "Limites à connaître : peu d'historique pour un client ou un "
+        "produit rare → confiance plus faible (voir get_model_performance "
+        "pour un score chiffré) ; les prix très éloignés du coût "
+        "(coefficient > ~3–5×) sont hors zone d'entraînement ; le délai "
+        "offre→décision, le format, le commercial, et les heuristiques de "
+        "pression concurrentielle / marge cible ne sont PAS utilisés par le "
+        "modèle ; l'outil ne remplace pas le jugement commercial, il "
+        "quantifie les habitudes passées."
+    ),
+}
+
+
+def _tool_app_guide(args: dict) -> dict:
+    """Static explanation of how the tool/interface itself works — no model
+    call, no computed numbers. Mirrors the 'Guide d'utilisation' page."""
+    topic = str(args.get("topic") or "tout").strip().lower()
+    if topic in ("tout", "all", ""):
+        return dict(_APP_GUIDE_FR)
+    if topic not in _APP_GUIDE_FR:
+        return {
+            "error": (
+                f"topic inconnu: {topic!r}. Valeurs possibles: "
+                f"{', '.join(_APP_GUIDE_FR)}, ou 'tout'."
+            )
+        }
+    return {topic: _APP_GUIDE_FR[topic]}
+
+
+# ---------------------------------------------------------------------
+# COMMERCIAL DASHBOARD TOOLS
+# (sourced from commercial_data.py — a disk-based port of the separate
+# "Tableau de bord Commercial" app's own loading/ABC/KPI logic; see that
+# module's docstring for how this data relates to the pricing history.)
+# ---------------------------------------------------------------------
+
+def _tool_commercial_kpis(args: dict) -> dict:
+    """Yearly KPI formula (CA devisé × % succès = CA commandes ; nb devis ×
+    % succès = nb commandes ; devis moyen / commande moyenne) — same numbers
+    as the dashboard's 'Performance Commerciale' section for one year."""
+    source = str(args.get("source", "")).lower()
+    if source not in commercial_data.VALID_SOURCES:
+        return {"error": "source doit être 'ponceblanc' ou 'lbfi'."}
+    try:
+        df = commercial_data.get_commercial_df(source)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Chargement impossible pour {source}: {exc}"}
+
+    years = sorted(int(y) for y in df["Année Devis"].dropna().unique())
+    if not years:
+        return {"error": f"Aucune année exploitable pour {source}."}
+
+    annee = args.get("annee")
+    annee = int(annee) if annee is not None else years[-1]
+
+    kpis = commercial_data.extraire_kpis_annee(df, annee)
+    if kpis is None:
+        return {
+            "error": f"Aucun devis pour l'année {annee} ({source}).",
+            "annees_disponibles": years,
+        }
+
+    return {
+        "source": source,
+        "annee": annee,
+        "annees_disponibles": years,
+        "ca_devise_eur": round(kpis["ca_devis"], 0),
+        "ca_signe_eur": round(kpis["ca_signe"], 0),
+        "taux_succes_ca_pct": round(kpis["tx_ca"], 2),
+        "nb_devis_emis": kpis["vol_devis"],
+        "nb_commandes_signees": kpis["vol_signe"],
+        "taux_succes_volume_pct": round(kpis["tx_vol"], 2),
+        "devis_moyen_eur": round(kpis["cmd_moy_tous"], 0),
+        "commande_moyenne_signee_eur": round(kpis["cmd_moy_signe"], 0),
+    }
+
+
+def _tool_client_abc_category(args: dict) -> dict:
+    """Which ABC portfolio category (GRAND COMPTE / CLIENT INTERMEDIAIRE /
+    PETITS CLIENTS / NOUVEAU CLIENT) a client falls into for a given year,
+    per the dashboard's cumulative-revenue-share classification, plus that
+    client's signed CA and quote count for the year."""
+    source = str(args.get("source", "")).lower()
+    if source not in commercial_data.VALID_SOURCES:
+        return {"error": "source doit être 'ponceblanc' ou 'lbfi'."}
+    client = str(args.get("client", "")).strip()
+    if not client:
+        return {"error": "client requis."}
+
+    try:
+        df = commercial_data.get_commercial_df(source)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Chargement impossible pour {source}: {exc}"}
+
+    client_s = df["Nom Client"].astype(str).str.upper()
+    c = client.upper()
+    mask = client_s == c
+    if not mask.any():
+        mask = client_s.str.contains(c, na=False)
+    sub = df.loc[mask]
+    if sub.empty:
+        return {"error": f"Client '{client}' introuvable pour {source}."}
+
+    years_client = sorted(int(y) for y in sub["Année Devis"].dropna().unique())
+    annee = args.get("annee")
+    annee = int(annee) if annee is not None else years_client[-1]
+
+    sub_year = sub[sub["Année Devis"] == annee]
+    if sub_year.empty:
+        return {
+            "error": f"Pas de devis pour '{client}' en {annee} ({source}).",
+            "annees_avec_devis_pour_ce_client": years_client,
+        }
+
+    cat = sub_year["Catégorie Client ABC"].mode()
+    categorie = str(cat.iloc[0]) if not cat.empty else None
+
+    mask_signe = sub_year["Signé?"].astype(str).str.upper().str.strip() == "O"
+    col_id = "DEVIS N°" if "DEVIS N°" in sub_year.columns else sub_year.columns[0]
+
+    return {
+        "source": source,
+        "client": str(sub_year["Nom Client"].iloc[0]),
+        "annee": annee,
+        "categorie_abc": categorie,
+        "nb_devis_annee": int(sub_year[col_id].nunique()),
+        "nb_devis_signes_annee": int(sub_year.loc[mask_signe, col_id].nunique()),
+        "ca_signe_eur_annee": round(float(sub_year.loc[mask_signe, "Prix total"].sum()), 0),
+        "annees_avec_devis_pour_ce_client": years_client,
+        "definition_categories": (
+            "Classement par part cumulée du CA signé de l'année, parmi les "
+            "clients déjà connus (signés) une année antérieure : "
+            "GRAND COMPTE = jusqu'à 80% du CA cumulé, CLIENT INTERMEDIAIRE "
+            "= 80-90%, PETITS CLIENTS = 90-100%. NOUVEAU CLIENT = aucun "
+            "devis signé avant cette année-là."
+        ),
+    }
+
+
+_ABC_DIMENSION_COLUMNS = {
+    "abc": "Catégorie Client ABC",
+    "type_produit": "Type de produit",
+    "commercial": "Commercial",
+}
+
+
+def _tool_commercial_breakdown(args: dict) -> dict:
+    """CA signé réparti par catégorie ABC, type de produit, ou commercial —
+    même agrégation que les camemberts de la section 'Répartition du CA
+    Commandes' du tableau de bord."""
+    source = str(args.get("source", "")).lower()
+    if source not in commercial_data.VALID_SOURCES:
+        return {"error": "source doit être 'ponceblanc' ou 'lbfi'."}
+    dimension = str(args.get("dimension", "abc")).lower()
+    col = _ABC_DIMENSION_COLUMNS.get(dimension)
+    if col is None:
+        return {
+            "error": (
+                f"dimension doit être une valeur parmi "
+                f"{list(_ABC_DIMENSION_COLUMNS)}."
+            )
+        }
+
+    try:
+        df = commercial_data.get_commercial_df(source)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Chargement impossible pour {source}: {exc}"}
+
+    if col not in df.columns:
+        return {
+            "error": (
+                f"Colonne '{col}' non disponible pour {source} "
+                f"(dimension '{dimension}')."
+            )
+        }
+
+    annee = args.get("annee")
+    sub = df
+    if annee is not None:
+        sub = sub[sub["Année Devis"] == int(annee)]
+
+    mask_signe = sub["Signé?"].astype(str).str.upper().str.strip() == "O"
+    sub_signe = sub.loc[mask_signe].copy()
+    sub_signe[col] = sub_signe[col].fillna("Non indiqué").replace("", "Non indiqué")
+
+    if sub_signe.empty:
+        return {
+            "source": source,
+            "annee": int(annee) if annee is not None else "toutes",
+            "dimension": dimension,
+            "repartition": [],
+            "message": "Aucun devis signé pour ces filtres.",
+        }
+
+    grouped = (
+        sub_signe.groupby(col)["Prix total"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    total = float(grouped.sum())
+    rows = [
+        {
+            dimension: str(name),
+            "ca_signe_eur": round(float(val), 0),
+            "part_pct": round(100 * float(val) / total, 1) if total else None,
+        }
+        for name, val in grouped.items()
+    ]
+
+    return {
+        "source": source,
+        "annee": int(annee) if annee is not None else "toutes",
+        "dimension": dimension,
+        "ca_signe_total_eur": round(total, 0),
+        "repartition": rows,
+    }
+
+
+def _tool_delay_stats(args: dict) -> dict:
+    """Délai moyen entre la date du devis et l'ouverture du dossier de
+    fabrication ('Délai devis ouverture'), globalement ou par année — même
+    donnée que la section '⏱️ Délai Moyen d'Ouverture des Devis'."""
+    source = str(args.get("source", "")).lower()
+    if source not in commercial_data.VALID_SOURCES:
+        return {"error": "source doit être 'ponceblanc' ou 'lbfi'."}
+
+    try:
+        df = commercial_data.get_commercial_df(source)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Chargement impossible pour {source}: {exc}"}
+
+    if "Délai devis ouverture" not in df.columns:
+        return {"error": f"Délai non calculable pour {source} (dates manquantes)."}
+
+    delai = pd.to_numeric(df["Délai devis ouverture"], errors="coerce")
+    sub = df.loc[delai.notna()].copy()
+    sub["_delai"] = delai.loc[delai.notna()]
+    if sub.empty:
+        return {"error": f"Aucune donnée de délai exploitable pour {source}."}
+
+    annee = args.get("annee")
+    if annee is not None:
+        sub_annee = sub[sub["Année Devis"] == int(annee)]
+        if sub_annee.empty:
+            return {"error": f"Aucun délai exploitable pour {source} en {annee}."}
+        return {
+            "source": source,
+            "annee": int(annee),
+            "n_devis": int(len(sub_annee)),
+            "delai_moyen_jours": round(float(sub_annee["_delai"].mean()), 1),
+            "delai_median_jours": round(float(sub_annee["_delai"].median()), 1),
+            "delai_max_jours": round(float(sub_annee["_delai"].max()), 1),
+        }
+
+    # No year filter: one row per year, mirrors the dashboard's annual chart
+    par_annee = (
+        sub.groupby("Année Devis")["_delai"]
+        .agg(["mean", "count"])
+        .reset_index()
+        .rename(columns={
+            "Année Devis": "annee",
+            "mean": "delai_moyen_jours",
+            "count": "n_devis",
+        })
+    )
+    par_annee["annee"] = par_annee["annee"].astype(int)
+    par_annee["delai_moyen_jours"] = par_annee["delai_moyen_jours"].round(1)
+    return {
+        "source": source,
+        "delai_moyen_jours_global": round(float(sub["_delai"].mean()), 1),
+        "n_devis_global": int(len(sub)),
+        "par_annee": par_annee.to_dict("records"),
+    }
+
+
 TOOL_IMPLS = {
     "get_price_recommendation": _tool_price_recommendation,
     "get_acceptance_probability": _tool_acceptance_probability,
@@ -677,6 +1113,12 @@ TOOL_IMPLS = {
     "update_form_inputs": _tool_update_form_inputs,
     "get_top_entities": _tool_top_entities,
     "get_seasonality_stats": _tool_seasonality_stats,
+    "get_model_performance": _tool_model_performance,
+    "get_app_guide": _tool_app_guide,
+    "get_commercial_kpis": _tool_commercial_kpis,
+    "get_client_abc_category": _tool_client_abc_category,
+    "get_commercial_breakdown": _tool_commercial_breakdown,
+    "get_delay_stats": _tool_delay_stats,
 }
 
 
@@ -959,6 +1401,202 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_model_performance",
+            "description": (
+                "Donne la fiabilité technique du modèle pour une source : "
+                "AUC et précision du classifieur d'acceptation, erreur du "
+                "prix recommandé (% et €), et un score de confiance /100 "
+                "avec conseil d'usage — le même contenu que la page "
+                "« Performance des modèles » de l'interface. Utilise ceci "
+                "pour 'peut-on faire confiance au modèle', 'quelle est sa "
+                "fiabilité', 'le modèle se trompe-t-il souvent', 'marge "
+                "d'erreur du prix recommandé', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["ponceblanc", "lbfi"],
+                    },
+                },
+                "required": ["source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_app_guide",
+            "description": (
+                "Explique le fonctionnement de l'outil/interface lui-même "
+                "(pas un calcul) : à quoi sert chaque champ, ce que "
+                "signifient les résultats affichés (prix recommandé, "
+                "P(acceptation), scénarios, courbe de sensibilité), le "
+                "principe technique, et les limites connues — même contenu "
+                "que la page « Guide d'utilisation ». Utilise ceci pour "
+                "'comment ça marche', 'que signifie ce champ / ce résultat', "
+                "'quelles sont les limites de l'outil', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "enum": [
+                            "tout",
+                            "apercu",
+                            "champs_saisis",
+                            "sorties_modele",
+                            "principe_technique",
+                            "limites",
+                        ],
+                        "description": (
+                            "Section à expliquer. Défaut 'tout' si non "
+                            "précisé."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_commercial_kpis",
+            "description": (
+                "Formule KPI annuelle du tableau de bord commercial : CA "
+                "devisé, CA signé, % de succès (€ et volume), nombre de "
+                "devis émis / commandes signées, devis moyen et commande "
+                "moyenne signée. Utilise ceci pour 'quel est notre CA en "
+                "2024', 'combien de devis signés cette année', 'quel est "
+                "le taux de transformation', 'panier moyen', etc. Données "
+                "issues du tableau de bord commercial (fichier "
+                "Query_tableau_devis.xlsx), distinct du fichier utilisé par "
+                "les modèles de prix."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["ponceblanc", "lbfi"],
+                    },
+                    "annee": {
+                        "type": "integer",
+                        "description": (
+                            "Année ciblée (ex. 2024). Si omis, utilise la "
+                            "dernière année disponible."
+                        ),
+                    },
+                },
+                "required": ["source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_client_abc_category",
+            "description": (
+                "Catégorie ABC d'un client pour une année donnée (GRAND "
+                "COMPTE / CLIENT INTERMEDIAIRE / PETITS CLIENTS / NOUVEAU "
+                "CLIENT), calculée par part cumulée du CA signé, plus son "
+                "CA signé et son nombre de devis cette année-là. Utilise "
+                "ceci pour 'quelle catégorie est ce client', 'est-ce un "
+                "grand compte', 'est-ce un nouveau client cette année', "
+                "etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["ponceblanc", "lbfi"],
+                    },
+                    "client": {"type": "string"},
+                    "annee": {
+                        "type": "integer",
+                        "description": (
+                            "Année ciblée. Si omis, utilise la dernière "
+                            "année où ce client a un devis."
+                        ),
+                    },
+                },
+                "required": ["source", "client"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_commercial_breakdown",
+            "description": (
+                "Répartition du CA signé par catégorie ABC, par type de "
+                "produit, ou par commercial (Ponceblanc uniquement), avec "
+                "le % de chaque part. Utilise ceci pour 'quelle part du CA "
+                "vient des grands comptes', 'quel produit fait le plus de "
+                "CA', 'quel commercial vend le plus', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["ponceblanc", "lbfi"],
+                    },
+                    "dimension": {
+                        "type": "string",
+                        "enum": ["abc", "type_produit", "commercial"],
+                        "description": "Défaut 'abc' si non précisé.",
+                    },
+                    "annee": {
+                        "type": "integer",
+                        "description": (
+                            "Année ciblée. Si omis, agrège toutes les "
+                            "années disponibles."
+                        ),
+                    },
+                },
+                "required": ["source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_delay_stats",
+            "description": (
+                "Délai moyen (en jours) entre la date du devis et "
+                "l'ouverture du dossier de fabrication, globalement ou "
+                "année par année si aucune année n'est précisée. Utilise "
+                "ceci pour 'combien de temps entre le devis et le "
+                "lancement en fabrication', 'le délai d'ouverture "
+                "s'améliore-t-il', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["ponceblanc", "lbfi"],
+                    },
+                    "annee": {
+                        "type": "integer",
+                        "description": (
+                            "Année ciblée. Si omis, retourne le délai "
+                            "moyen global ET le détail année par année."
+                        ),
+                    },
+                },
+                "required": ["source"],
+            },
+        },
+    },
 ]
 
 
@@ -1046,6 +1684,11 @@ _CONTEXT_FILLABLE_FIELDS: dict[str, tuple[str, ...]] = {
     "get_client_acceptance_rate": ("source", "client"),
     "get_top_entities": ("source",),
     "get_seasonality_stats": ("source", "client", "produit"),
+    "get_model_performance": ("source",),
+    "get_commercial_kpis": ("source",),
+    "get_client_abc_category": ("source", "client"),
+    "get_commercial_breakdown": ("source",),
+    "get_delay_stats": ("source",),
 }
 
 
@@ -1484,7 +2127,17 @@ def run_chat_turn(
                 ) from api_exc
             raise RuntimeError(f"Erreur OpenRouter / LLM: {err}") from api_exc
 
+        if response is None or not getattr(response, "choices", None):
+            raise RuntimeError(
+                "Réponse LLM vide ou sans choices (modèle indisponible / "
+                f"rate-limit OpenRouter). Modèle: {CHAT_MODEL}"
+            )
         choice = response.choices[0]
+        if choice is None or getattr(choice, "message", None) is None:
+            raise RuntimeError(
+                "Réponse LLM sans message utilisable "
+                f"(modèle: {CHAT_MODEL})."
+            )
         msg = choice.message
 
         # No tool calls → final answer (unless it refused a form change)
@@ -1578,10 +2231,23 @@ def run_chat_turn(
 
         # Execute each tool and append results
         for tc in msg.tool_calls:
-            name = tc.function.name
+            fn = getattr(tc, "function", None)
+            if fn is None or not getattr(fn, "name", None):
+                api_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": getattr(tc, "id", "unknown"),
+                        "content": json.dumps(
+                            {"error": "Appel d'outil mal formé (function manquante)."},
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                continue
+            name = fn.name
             try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
+                args = json.loads(fn.arguments or "{}")
+            except (json.JSONDecodeError, TypeError):
                 args = {}
             args = _fill_args_from_context(name, args, form_context)
 
