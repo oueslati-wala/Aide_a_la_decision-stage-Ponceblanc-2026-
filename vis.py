@@ -229,6 +229,23 @@ hr { border-color: var(--card-border) !important; }
     font-size: 0.78rem !important;
 }
 
+/* --- Assistant panel sizing ---
+   Docked mode: no override needed — Streamlit's sidebar is natively
+   resizable by dragging its right border, so the docked assistant panel
+   already gets that behavior for free.
+   Side-panel mode: real drag-handle installed via JS (see the chat panel
+   rendering code) so it matches that same native sidebar feel, since a
+   plain CSS `resize` handle only gives a small corner grip, not a
+   drag-the-border experience. */
+
+/* Message box: drag the bottom edge to make it taller/shorter. */
+.st-key-chat_msgs_box > div[data-testid="stVerticalBlock"] {
+    resize: vertical !important;
+    overflow: auto !important;
+    min-height: 220px;
+    max-height: 800px;
+}
+
 </style>
 """
 
@@ -602,6 +619,8 @@ if page == "Aide à la décision":
     if _chat_src in ("ponceblanc", "lbfi"):
         st.session_state["source_main"] = _chat_src
 
+    # Reserve a right column for the chat panel whenever it's open.
+    # Baseline ratio only — the actual width is drag-resizable (see CSS/JS).
     if st.session_state.chat_open:
         form_col, chat_col = st.columns([1.7, 1], gap="large")
     else:
@@ -1908,6 +1927,100 @@ if page == "Aide à la décision":
     # ------------------------------------------------------------------
     if st.session_state.chat_open and chat_col is not None:
         with chat_col:
+            # Invisible marker so the drag-handle script below can find this
+            # specific Streamlit column.
+            st.container(key="chat_side_col")
+            components.html(
+                f"""
+<!DOCTYPE html><html><head><meta charset="utf-8"/></head><body>
+<script>
+(function() {{
+  const doc = window.parent.document;
+  const STORE_KEY = 'devis_chat_side_width';
+  const MIN_W = 300, MAX_W = 900, DEFAULT_W = 420;
+
+  function init() {{
+    const marker = doc.querySelector('.st-key-chat_side_col');
+    if (!marker) return false;
+    const chatCol = marker.closest('[data-testid="stColumn"]');
+    if (!chatCol) return false;
+    const row = chatCol.parentElement;
+    if (!row) return false;
+    const cols = Array.from(row.querySelectorAll(':scope > [data-testid="stColumn"]'));
+    const formCol = cols.find(c => c !== chatCol);
+    if (!formCol) return false;
+
+    // Fixed-width chat column that the handle can resize; form column
+    // absorbs whatever space remains — same relationship as the native
+    // sidebar vs. main content area.
+    let savedW = parseInt(localStorage.getItem(STORE_KEY) || String(DEFAULT_W), 10);
+    if (isNaN(savedW)) savedW = DEFAULT_W;
+    savedW = Math.min(MAX_W, Math.max(MIN_W, savedW));
+    chatCol.style.flex = '0 0 auto';
+    chatCol.style.width = savedW + 'px';
+    chatCol.style.position = 'relative';
+    formCol.style.flex = '1 1 auto';
+    formCol.style.minWidth = '0';
+
+    if (chatCol.querySelector(':scope > .devis-resize-handle')) return true;
+
+    const handle = doc.createElement('div');
+    handle.className = 'devis-resize-handle';
+    Object.assign(handle.style, {{
+      position: 'absolute', left: '-4px', top: '0', bottom: '0', width: '8px',
+      cursor: 'col-resize', zIndex: '999', background: 'transparent',
+      transition: 'background 0.15s',
+    }});
+    chatCol.insertBefore(handle, chatCol.firstChild);
+
+    let dragging = false, startX = 0, startW = 0;
+    function onMove(e) {{
+      if (!dragging) return;
+      let w = startW + (startX - e.clientX);
+      w = Math.min(MAX_W, Math.max(MIN_W, w));
+      chatCol.style.width = w + 'px';
+    }}
+    function onUp() {{
+      if (!dragging) return;
+      dragging = false;
+      handle.style.background = 'transparent';
+      doc.body.style.cursor = '';
+      doc.body.style.userSelect = '';
+      localStorage.setItem(STORE_KEY, String(parseInt(chatCol.style.width, 10)));
+      doc.removeEventListener('mousemove', onMove);
+      doc.removeEventListener('mouseup', onUp);
+    }}
+    handle.addEventListener('mousedown', function(e) {{
+      dragging = true;
+      startX = e.clientX;
+      startW = chatCol.getBoundingClientRect().width;
+      doc.body.style.cursor = 'col-resize';
+      doc.body.style.userSelect = 'none';
+      handle.style.background = 'rgba(169,85,47,0.35)';
+      doc.addEventListener('mousemove', onMove);
+      doc.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    }});
+    handle.addEventListener('mouseenter', function() {{
+      if (!dragging) handle.style.background = 'rgba(169,85,47,0.15)';
+    }});
+    handle.addEventListener('mouseleave', function() {{
+      if (!dragging) handle.style.background = 'transparent';
+    }});
+    return true;
+  }}
+
+  let tries = 0;
+  const iv = setInterval(function() {{
+    tries += 1;
+    if (init() || tries > 60) clearInterval(iv);
+  }}, 50);
+}})();
+</script>
+</body></html>
+                """,
+                height=0,
+            )
             head_l, head_r = st.columns([4, 1])
             with head_l:
                 st.markdown(
@@ -1924,8 +2037,9 @@ if page == "Aide à la décision":
                         st.session_state.chat_messages = []
                         st.rerun()
 
-            # Compact height so header + messages + input fit on one screen
-            chat_box = st.container(height=380, border=True)
+            # Drag the panel's left edge (width, via the handle above) or the
+            # box's bottom edge (height) to resize.
+            chat_box = st.container(height=380, border=True, key="chat_msgs_box")
             with chat_box:
                 if not st.session_state.chat_messages:
                     st.markdown(
